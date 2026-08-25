@@ -8,6 +8,90 @@ import gymnasium as gym
 from PIL import Image
 import cv2
 
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from fpdf import FPDF
+from PIL import Image
+
+def generate_pdf_report(episode_rewards, eval_frames, filename="learning_report.pdf"):
+    """
+    Generates a PDF report containing training reward metrics and captured evaluation frames.
+    """
+    # 1. Render and save the learning curve plot
+    plt.figure(figsize=(6, 3))
+    plt.plot(episode_rewards, label="Episode Reward", color="#2b5c8f", alpha=0.6)
+    
+    # Calculate 20-episode moving average
+    if len(episode_rewards) >= 20:
+        ma = [np.mean(episode_rewards[max(0, i-20):i+1]) for i in range(len(episode_rewards))]
+        plt.plot(ma, label="20-Ep Moving Avg", color="#d95f02", linewidth=2)
+        
+    plt.title("Agent Learning Progress")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    
+    plot_path = "temp_reward_plot.png"
+    plt.savefig(plot_path, dpi=200)
+    plt.close()
+
+    # 2. Extract 4 evenly spaced evaluation frames
+    frame_paths = []
+    step_size = max(1, len(eval_frames) // 4)
+    sampled_frames = eval_frames[::step_size][:4]
+
+    for idx, frame in enumerate(sampled_frames):
+        img_path = f"temp_frame_{idx}.png"
+        if isinstance(frame, np.ndarray):
+            if frame.dtype != np.uint8:
+                frame = (frame * 255).astype(np.uint8)
+            Image.fromarray(frame).save(img_path)
+        frame_paths.append(img_path)
+
+    # 3. Assemble PDF layout
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # Header
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 10, "Brain Model Training & Behavior Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(5)
+
+    # Summary Statistics
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 6, f"Total Training Episodes: {len(episode_rewards)}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Final Moving Avg Reward: {np.mean(episode_rewards[-20:]):.2f}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Peak Episode Reward: {max(episode_rewards):.2f}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+
+    # Section 1: Learning Curve
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "1. Learning Performance", new_x="LMARGIN", new_y="NEXT")
+    pdf.image(plot_path, x=15, w=180)
+    pdf.ln(5)
+
+    # Section 2: Behavior Frames
+    pdf.cell(0, 8, "2. Replicated Behavior (Evaluation Rollout)", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    # Render a 2x2 grid of evaluation frames
+    x_coords = [15, 105, 15, 105]
+    y_start = pdf.get_y()
+    for i, fpath in enumerate(frame_paths):
+        y_pos = y_start if i < 2 else y_start + 55
+        pdf.image(fpath, x=x_coords[i], y=y_pos, w=85)
+
+    pdf.output(filename)
+
+    # Clean up temporary image files
+    os.remove(plot_path)
+    for fpath in frame_paths:
+        if os.path.exists(fpath):
+            os.remove(fpath)
+
 ## The world is an abstraction over what our agents can see:
 # the way I see this is that we can observe the world, get rewards, etc
 # doubts: 
@@ -230,20 +314,28 @@ class Brain(nn.Module):
  
     def forward(self, obs):
         mem_snap = self.memory.snapshot()
-        proto = self.perception(obs)                     # (d_model,)
-        query = proto.unsqueeze(0).unsqueeze(0)           # (1, 1, d_model)
+        protomemory = self.perception(obs)                     # (d_model,)
+        query = protomemory.unsqueeze(0).unsqueeze(0)           # (1, 1, d_model)
  
         if mem_snap is not None:
             kv = mem_snap.unsqueeze(0)             # (1, k, d_model)
             attended, _ = self.attention(query, kv, kv)
             attended = attended.squeeze(0).squeeze(0)      # (d_model,)
         else:
-            attended = torch.zeros_like(proto)
+            attended = torch.zeros_like(protomemory)
  
-        fused = torch.cat([proto, attended], dim=-1)       # (2*d_model,)
-        action_logits = self.cortex(fused)
-        value = self.reward_center(fused)
-        return action_logits, value, proto.detach()
+        fused = torch.cat([protomemory, attended], dim=-1)       # (2*d_model,)
+        action = self.cortex(fused)
+        predicted_reward = self.reward_center(fused)
+        return action, predicted_reward, protomemory.detach()
+
+
+class Agent:
+    def __init__(self):
+        pass
+
+    def observe_and_act(self):
+        pass
 
 
 def train(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=20,render=False):
@@ -258,26 +350,26 @@ def train(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=2
         world.reset()
         done = False
         ep_reward = 0.0
-        log_probs, values, rewards, entropies = [], [], [], []
+        log_probs, predicted_rewards, rewards, entropies = [], [], [], []
  
         while not done:
             viewed_world = world.observe()
-            logits, value, proto = brain(viewed_world)
+            action, predicted_reward, protomemory = brain(viewed_world)
  
-            dist = torch.distributions.Categorical(logits=logits)
+            dist = torch.distributions.Categorical(logits=action)
             action = dist.sample()
  
             next_obs, reward, done, _ = world.act(action.item())
  
             log_probs.append(dist.log_prob(action))
-            values.append(value)
+            predicted_rewards.append(predicted_reward)
             rewards.append(reward)
             entropies.append(dist.entropy())
  
             # crude "surprise" signal used purely to decide what's worth
             # remembering; the real learning signal is the loss below
-            reward_prediction_error = reward - value.item()
-            brain.remember(proto=proto, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
+            reward_prediction_error = reward - predicted_reward.item()
+            brain.remember(proto=protomemory, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
  
             ep_reward += reward
  
@@ -287,8 +379,9 @@ def train(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=2
         for r in reversed(rewards):
             R = r + gamma * R
             returns.insert(0, R)
+
         returns = torch.tensor(returns, dtype=torch.float32)
-        values_t = torch.stack(values)
+        values_t = torch.stack(predicted_rewards)
         advantages = returns - values_t.detach()
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -312,11 +405,82 @@ def train(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=2
             print(f"Episode {episode + 1:4d} | avg reward (last {log_every}): {avg:.1f}")
  
     return brain, episode_rewards
+
+
+def train_single(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=20, render=False):
+    world = World("CartPole-v1", render=render)
+    brain = Brain(world)
+    optimizer = torch.optim.Adam(brain.parameters(), lr=lr)
+ 
+    episode_rewards = []
+ 
+    for episode in range(num_episodes):
+        world.reset()
+        done = False
+        ep_reward = 0.0
+ 
+        while not done:
+            viewed_world = world.observe()
+            action_logits, value, protomemory = brain(viewed_world)
+ 
+            dist = torch.distributions.Categorical(logits=action_logits)
+            action = dist.sample()
+ 
+            _, reward, done, _ = world.act(action.item())
+            ep_reward += reward
+
+            # --- 1. Compute 1-Step TD Target & Advantage ---
+            if done:
+                next_value = torch.tensor(0.0)
+            else:
+                with torch.no_grad():
+                    next_view = world.observe()
+                    _, next_value, _ = brain(next_view)
+
+            target = reward + gamma * next_value
+            advantage = (target - value).detach()
+
+            # --- 2. Step-Level Loss Computation ---
+            actor_loss = -dist.log_prob(action) * advantage
+            critic_loss = F.mse_loss(value.unsqueeze(0), target.unsqueeze(0))
+            entropy_bonus = dist.entropy()
+
+            p = episode / num_episodes
+
+            # Linear schedules
+            w_recon  = max(0.05, 1.0 - p)        # Decays from 1.0 down to 0.05
+            w_critic = min(0.5, 0.1 + 0.4 * p)   # Increases from 0.1 up to 0.5
+            w_actor  = min(1.0, 0.05 + 0.95 * p) # Increases from 0.05 up to 1.0
+
+            # Calculate total loss for current step
+            recon_loss = F.mse_loss(brain.reconstruct(protomemory), viewed_world)
+            loss = (w_recon * recon_loss) + (w_actor * actor_loss) + (w_critic * critic_loss) - (entropy_coef * entropy_bonus)
+
+            # --- 3. Immediate Gradient Update ---
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(brain.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # --- 4. Store Memory ---
+            brain.remember(
+                proto=protomemory, 
+                action=action.item(), 
+                reward=reward, 
+                reward_prediction_error=advantage.item()
+            )
+ 
+        episode_rewards.append(ep_reward)
+        if (episode + 1) % log_every == 0:
+            avg = np.mean(episode_rewards[-log_every:])
+            print(f"Episode {episode + 1:4d} | avg reward (last {log_every}): {avg:.1f}")
+ 
+    return brain, episode_rewards
  
  
 def watch(brain, num_episodes=100, greedy=True, render=True):
     world = World("CartPole-v1", render=render)
- 
+    captured_frames = []
     for episode in range(num_episodes):
         world.reset()
         done = False
@@ -329,6 +493,7 @@ def watch(brain, num_episodes=100, greedy=True, render=True):
             action = torch.argmax(logits) if greedy else dist.sample()
  
             next_obs, reward, done, _ = world.act(action.item())
+            captured_frames.append(world.env.render())
             reward_prediction_error = reward - value.item()
             brain.remember(proto=proto, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
  
@@ -336,11 +501,14 @@ def watch(brain, num_episodes=100, greedy=True, render=True):
         print(f"[watch] Episode {episode + 1}: reward = {ep_reward:.0f}")
  
     world.close()
+    return captured_frames
  
  
 if __name__ == "__main__":
     # Train headless (fast), then pop open a window to watch the result.
     # Flip to obs_type="pixels" to make the same Brain code learn from
     # raw frames instead of CartPole's hand-crafted 4-number state.
-    trained_brain, rewards = train(num_episodes=500, render=False)
-    watch(trained_brain, num_episodes=3, render=True)
+    trained_brain, rewards = train_single(num_episodes=500, render=False)
+    captured_frames = watch(trained_brain, num_episodes=3, render=True)
+    generate_pdf_report(rewards,captured_frames)
+    
