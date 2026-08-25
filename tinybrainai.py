@@ -14,6 +14,9 @@ import matplotlib.pyplot as plt
 from fpdf import FPDF
 from PIL import Image
 
+import torchvision.models as models
+from torchvision.models import ResNet18_Weights
+
 def generate_pdf_report(episode_rewards, eval_frames, filename="learning_report.pdf"):
     """
     Generates a PDF report containing training reward metrics and captured evaluation frames.
@@ -174,31 +177,10 @@ class Memory:
             if abs(transition.reward_prediction_error) > abs(self.long_term[min_idx].reward_prediction_error):
                 self.long_term[min_idx] = transition
 
-    def snapshot(self, k=8):
-        pool = list(self.short_term) + self.long_term
-        if not pool:
-            return None
-        
-        sample = random.sample(pool, min(k, len(pool)))
-        return torch.stack([t.proto for t in sample])
-
-    def add(self, transition):
-        self.short_term.append(transition)
-        if len(self.long_term) < self.long_capacity:
-            self.long_term.append(transition)
-        else:
-            min_idx = min(
-                range(len(self.long_term)),
-                key=lambda i: abs(self.long_term[i].reward_prediction_error)
-            )
-            if abs(transition.reward_prediction_error) > abs(self.long_term[min_idx].reward_prediction_error):
-                self.long_term[min_idx] = transition
-
     def snapshot(self, k_longterm=4):
         if not self.short_term:
             return None
-        ## this is stupid but for the moment I don't know a better way. I think the 
-        # atention mechanism should look at all memories and decide
+
         sequential_protos = [t.proto for t in self.short_term]
         long_protos = []
         if self.long_term:
@@ -206,10 +188,13 @@ class Memory:
             long_protos = [t.proto for t in random.sample(self.long_term, k)]
         return torch.stack(sequential_protos + long_protos)
 
+    def random_long_term_memory(self) :
+        return random.sample(self.long_term, 1)[0]
+
 ## The conv encoder is supposed to be a backbone 
 # of some YOLO famous network, the goal is that this is a 
 # thing that generates an embbedding of the world
-class ConvEncoder(nn.Module):
+class Perception(nn.Module):
     def __init__(self, in_channels, img_size, d_model):
         super().__init__()
         self.in_channels = in_channels
@@ -235,13 +220,20 @@ class ConvEncoder(nn.Module):
         latent = self.fc(x)
         return latent.squeeze(0) if single else latent
 
+    def freeze_weights(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def activate_weights(self):
+        for param in self.parameters():
+            param.requires_grad = True   
 
 ## The conv dencoder is supposed to be something that can 
 # interpret the embedding of the encoder and recreate the original image
 # from the world. This should be used to understand if the model is correctly 
 # simulating the world
-class ConvDecoder(nn.Module):
-    def __init__(self, encoder: ConvEncoder):
+class Projection(nn.Module):
+    def __init__(self, encoder: Perception):
         super().__init__()
         c, h, w = encoder.conv_out_shape
         self._unflatten_shape = (c, h, w)
@@ -267,6 +259,14 @@ class ConvDecoder(nn.Module):
                                    mode="bilinear", align_corners=False)
         return recon.squeeze(0) if single else recon
 
+    def freeze_weights(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def activate_weights(self):
+        for param in self.parameters():
+            param.requires_grad = True   
+
 class Cortex(nn.Module):
     def __init__(self, d_model, n_actions):
         super().__init__()
@@ -278,7 +278,14 @@ class Cortex(nn.Module):
  
     def forward(self, fused):
         return self.net(fused)
- 
+
+    def freeze_weights(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def activate_weights(self):
+        for param in self.parameters():
+            param.requires_grad = True   
  
 class RewardCenter(nn.Module):
     def __init__(self, d_model):
@@ -291,52 +298,143 @@ class RewardCenter(nn.Module):
  
     def forward(self, fused):
         return self.net(fused).squeeze(-1)
- 
- 
-class Brain(nn.Module):
-    def __init__(self, world, d_model=32, num_heads=2):
+
+    def freeze_weights(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def activate_weights(self):
+        for param in self.parameters():
+            param.requires_grad = True   
+
+class DreamerCenter(nn.Module):
+    def __init__(self, d_model):
+        pass
+
+    def freeze_weights(self):
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def activate_weights(self):
+        for param in self.parameters():
+            param.requires_grad = True  
+
+class Agent(nn.Module):
+    def __init__(self, world, d_model=32, num_heads=2, lr=1e-3, gamma=0.99, entropy_coef=0.01):
         super().__init__()
-        self.memory = Memory()
-        frame_stack, img_size, _ = world.obs_shape
-        self.perception = ConvEncoder(frame_stack, img_size, d_model)
-        self.decoder = ConvDecoder(self.perception) 
- 
-        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
-        self.cortex = Cortex(d_model, world.n_actions)
-        self.reward_center = RewardCenter(d_model)
         self.d_model = d_model
- 
-    def reconstruct(self, latent):
-        return self.decoder(latent)
+        self.gamma = gamma
+        self.entropy_coef = entropy_coef
+        self.is_asleep = False
+        
+        frame_stack, img_size, _ = world.obs_shape
+        self.memory = Memory()
+        self.perception = Perception(frame_stack, img_size, d_model)
+        self.decoder = Projection(self.perception) 
+        self.dreamer = DreamerCenter(d_model, world.n_actions) # Expects (z, action)
+        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
+        
+        self.cortex = Cortex(d_model * 2, world.n_actions)
+        self.reward_center = RewardCenter(d_model * 2)
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+
+    def waking_up(self):
+        self.cortex.freeze_weights()
+        self.dreamer.freeze_weights()
+        self.reward_center.activate_weights()
+        self.perception.activate_weights()
+        self.decoder.activate_weights()
+        self.is_asleep = False
+
+    def awake_cycle(self, worldview):
+        mem_snap = self.memory.snapshot()
+        protomemory = self.perception(worldview)  
+        query = protomemory.unsqueeze(0).unsqueeze(0) 
+
+        if mem_snap is not None:
+            kv = mem_snap.unsqueeze(0)
+            attended, _ = self.attention(query, kv, kv)
+            attended = attended.squeeze(0).squeeze(0)
+        else:
+            attended = torch.zeros_like(protomemory)
+
+        fused = torch.cat([protomemory, attended], dim=-1)
+        action = self.cortex(fused)
+        predicted_reward = self.reward_center(fused)
+        recreated_world_view = self.decoder(protomemory)
+        
+        # Pass state + action to dreamer
+        predicted_next_embedding = self.dreamer(protomemory.detach(), action.detach())
+
+        return action.detach(), predicted_reward, recreated_world_view, protomemory.detach(), predicted_next_embedding
+
+    def going_to_sleep(self):
+        self.cortex.activate_weights()
+        self.dreamer.activate_weights()
+        self.reward_center.freeze_weights()
+        self.perception.freeze_weights()
+        self.decoder.freeze_weights()
+        self.is_asleep = True
+
+    def sleep(self, number_of_dreams):
+        log_probs, predicted_rewards, rewards, entropies = [], [], [], []
+        mem_snap = self.memory.snapshot()
+        dream = self.memory.random_long_term_memory()
+
+        for i in range(number_of_dreams):
+            query = dream.unsqueeze(0).unsqueeze(0) 
+
+            if mem_snap is not None:
+                kv = mem_snap.unsqueeze(0)
+                attended, _ = self.attention(query, kv, kv)
+                attended = attended.squeeze(0).squeeze(0)
+            else:
+                attended = torch.zeros_like(dream)
+
+            fused = torch.cat([dream, attended], dim=-1)
+            action_logits = self.cortex(fused)
+
+            dist = torch.distributions.Categorical(logits=action_logits)
+            action = dist.sample()
+
+            predicted_reward = self.reward_center(fused)
+            
+            # Roll forward in latent space using dreamer
+            dream = self.dreamer(dream, action)
+
+            log_probs.append(dist.log_prob(action))
+            predicted_rewards.append(predicted_reward)
+            rewards.append(predicted_reward.detach()) # Use predicted reward in dreams
+            entropies.append(dist.entropy())
+
+        # ---- Discounted returns & Advantage calculation ----
+        returns, R = [], 0.0
+        for r in reversed(rewards):
+            R = r + self.gamma * R
+            returns.insert(0, R)
+
+        returns = torch.tensor(returns, dtype=torch.float32)
+        values_t = torch.stack(predicted_rewards).squeeze()
+        advantages = returns - values_t.detach()
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        log_probs_t = torch.stack(log_probs)
+        entropies_t = torch.stack(entropies)
+
+        actor_loss = -(log_probs_t * advantages).mean()
+        critic_loss = F.mse_loss(values_t, returns)
+        entropy_bonus = entropies_t.mean()
+        loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy_bonus
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        self.optimizer.step()
 
     def remember(self, proto, action, reward, reward_prediction_error):
         self.memory.add(Association(proto, action, reward, reward_prediction_error))
- 
-    def forward(self, obs):
-        mem_snap = self.memory.snapshot()
-        protomemory = self.perception(obs)                     # (d_model,)
-        query = protomemory.unsqueeze(0).unsqueeze(0)           # (1, 1, d_model)
- 
-        if mem_snap is not None:
-            kv = mem_snap.unsqueeze(0)             # (1, k, d_model)
-            attended, _ = self.attention(query, kv, kv)
-            attended = attended.squeeze(0).squeeze(0)      # (d_model,)
-        else:
-            attended = torch.zeros_like(protomemory)
- 
-        fused = torch.cat([protomemory, attended], dim=-1)       # (2*d_model,)
-        action = self.cortex(fused)
-        predicted_reward = self.reward_center(fused)
-        return action, predicted_reward, protomemory.detach()
-
-
-class Agent:
-    def __init__(self):
-        pass
-
-    def observe_and_act(self):
-        pass
-
 
 def train(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=20,render=False):
     world = World("CartPole-v1", render=render)
@@ -476,7 +574,81 @@ def train_single(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_
             print(f"Episode {episode + 1:4d} | avg reward (last {log_every}): {avg:.1f}")
  
     return brain, episode_rewards
- 
+
+def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=False):
+    world = World("CartPole-v1", render=render)
+    agent = Agent(world, d_model=32, lr=lr)
+
+    episode_rewards = []
+
+    for episode in range(num_episodes):
+        # ====================================================
+        # PHASE 1: AWAKE PHASE (Environment & World Model)
+        # ====================================================
+        agent.waking_up()
+
+        awake_optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, agent.parameters()), lr=lr
+        )
+
+        world.reset()
+        done = False
+        ep_reward = 0.0
+
+        while not done:
+            viewed_world = world.observe()
+
+            # 1. Perception forward pass
+            action_logits, pred_reward, recon_world, proto, pred_next_proto = agent.awake_cycle(viewed_world)
+
+            # 2. Sample action & step environment
+            dist = torch.distributions.Categorical(logits=action_logits)
+            action = dist.sample()
+            next_obs, reward, done, _ = world.act(action.item())
+
+            # 3. Compute ground truth target for next frame's embedding
+            with torch.no_grad():
+                next_proto_target = agent.perception(next_obs)
+
+            # 4. Compute World Model losses
+            recon_loss = F.mse_loss(recon_world, viewed_world)
+            reward_loss = F.mse_loss(pred_reward.squeeze(), torch.tensor(reward, dtype=torch.float32))
+            dynamics_loss = F.mse_loss(pred_next_proto, next_proto_target)
+
+            awake_loss = recon_loss + reward_loss + dynamics_loss
+
+            # 5. Backpropagate & step perception/world model weights
+            awake_optimizer.zero_grad()
+            awake_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
+            awake_optimizer.step()
+
+            # 6. Save association snapshot into memory
+            reward_prediction_error = abs(reward - pred_reward.item())
+            agent.remember(
+                proto=proto,
+                action=action.item(),
+                reward=reward,
+                reward_prediction_error=reward_prediction_error
+            )
+
+            ep_reward += reward
+
+        episode_rewards.append(ep_reward)
+
+        # ====================================================
+        # PHASE 2: SLEEP PHASE (Imagination & Policy Optimization)
+        # ====================================================
+        if len(agent.memory) > 0:
+            agent.going_to_sleep()
+            agent.sleep(number_of_dreams=number_of_dreams)
+
+        # Logging
+        if (episode + 1) % log_every == 0:
+            avg = np.mean(episode_rewards[-log_every:])
+            print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
+
+    return agent, episode_rewards
  
 def watch(brain, num_episodes=100, greedy=True, render=True):
     world = World("CartPole-v1", render=render)
