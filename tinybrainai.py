@@ -13,87 +13,218 @@ import numpy as np
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 from PIL import Image
+import matplotlib.colors as mcolors
 
-import torchvision.models as models
-from torchvision.models import ResNet18_Weights
 
-def generate_pdf_report(episode_rewards, eval_frames, filename="learning_report.pdf"):
+def plot_metric_trend(list_of_lists, title, ylabel, save_path,
+                       early_color="red", late_color="blue",
+                       xlabel="Step within episode", legend_label="Episode"):
     """
-    Generates a PDF report containing training reward metrics and captured evaluation frames.
+    Generic version of the earlier reward-error plot: takes ANY list of
+    lists (outer index = episode, inner list = a per-step metric for
+    that episode) and plots every episode's curve on one axes, colored
+    on a gradient from `early_color` (earliest episodes) to `late_color`
+    (latest episodes). Used for prediction error, decoding error, and
+    world-evolution error alike -- only the title/ylabel differ.
     """
-    # 1. Render and save the learning curve plot
+    n_epochs = len(list_of_lists)
+    if n_epochs == 0:
+        return None
+ 
+    cmap = mcolors.LinearSegmentedColormap.from_list("epoch_gradient", [early_color, late_color])
+ 
+    plt.figure(figsize=(7, 4))
+    for i, series in enumerate(list_of_lists):
+        if not series:
+            continue
+        t = i / max(1, n_epochs - 1)  # 0.0 for the first episode, 1.0 for the last
+        plt.plot(series, color=cmap(t), alpha=0.5, linewidth=1)
+ 
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True, linestyle="--", alpha=0.4)
+ 
+    # Colorbar doubles as the legend for the red->blue = early->late gradient
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=n_epochs - 1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=plt.gca())
+    cbar.set_label(legend_label)
+ 
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    return save_path
+ 
+ 
+def plot_reward_error_trends(reward_error_history, save_path="temp_rpe_trend.png",
+                              early_color="red", late_color="blue"):
+    """Thin wrapper kept for backwards compatibility -- see plot_metric_trend."""
+    return plot_metric_trend(
+        reward_error_history,
+        title="Reward Prediction Error per Step, Across Training",
+        ylabel="Reward Prediction Error",
+        save_path=save_path,
+        early_color=early_color,
+        late_color=late_color,
+    )
+ 
+ 
+def plot_reward_curve(rewards, save_path="temp_reward_plot.png", moving_avg_window=20):
+    """
+    Flat (not list-of-lists) reward-per-episode curve, with an optional
+    moving average overlay. Factored out of generate_pdf_report so
+    ErrorTracking.render_pdf can reuse the exact same plot.
+    """
     plt.figure(figsize=(6, 3))
-    plt.plot(episode_rewards, label="Episode Reward", color="#2b5c8f", alpha=0.6)
-    
-    # Calculate 20-episode moving average
-    if len(episode_rewards) >= 20:
-        ma = [np.mean(episode_rewards[max(0, i-20):i+1]) for i in range(len(episode_rewards))]
-        plt.plot(ma, label="20-Ep Moving Avg", color="#d95f02", linewidth=2)
-        
+    plt.plot(rewards, label="Episode Reward", color="#2b5c8f", alpha=0.6)
+ 
+    if len(rewards) >= moving_avg_window:
+        ma = [np.mean(rewards[max(0, i - moving_avg_window):i + 1]) for i in range(len(rewards))]
+        plt.plot(ma, label=f"{moving_avg_window}-Ep Moving Avg", color="#d95f02", linewidth=2)
+ 
     plt.title("Agent Learning Progress")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.legend()
     plt.tight_layout()
-    
-    plot_path = "temp_reward_plot.png"
-    plt.savefig(plot_path, dpi=200)
+    plt.savefig(save_path, dpi=200)
     plt.close()
+    return save_path
 
-    # 2. Extract 4 evenly spaced evaluation frames
-    frame_paths = []
-    step_size = max(1, len(eval_frames) // 4)
-    sampled_frames = eval_frames[::step_size][:4]
 
-    for idx, frame in enumerate(sampled_frames):
-        img_path = f"temp_frame_{idx}.png"
-        if isinstance(frame, np.ndarray):
-            if frame.dtype != np.uint8:
-                frame = (frame * 255).astype(np.uint8)
-            Image.fromarray(frame).save(img_path)
-        frame_paths.append(img_path)
+class ErrorTracking:
+    def __init__(self):
+        self.rewards = []
+        self.episode_prediction_errors = []
+        self.episode_decoding_errors = []
+        self.episode_world_evolution_errors = []
 
-    # 3. Assemble PDF layout
-    pdf = FPDF()
-    pdf.add_page()
-    
-    # Header
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, "Brain Model Training & Behavior Report", new_x="LMARGIN", new_y="NEXT", align="C")
-    pdf.ln(5)
+        self.intra_episode_prediction_errors = []
+        self.intra_episode_decoding_errors = []
+        self.intra_episode_world_evolution_errors = []
 
-    # Summary Statistics
-    pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 6, f"Total Training Episodes: {len(episode_rewards)}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"Final Moving Avg Reward: {np.mean(episode_rewards[-20:]):.2f}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"Peak Episode Reward: {max(episode_rewards):.2f}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(5)
+        self.episode_actor_loss = []
+        self.episode_entropy_loss = []
 
-    # Section 1: Learning Curve
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.cell(0, 8, "1. Learning Performance", new_x="LMARGIN", new_y="NEXT")
-    pdf.image(plot_path, x=15, w=180)
-    pdf.ln(5)
+    def start_episode(self):
+        self.intra_episode_prediction_errors = []
+        self.intra_episode_decoding_errors = []
+        self.intra_episode_world_evolution_errors = []
 
-    # Section 2: Behavior Frames
-    pdf.cell(0, 8, "2. Replicated Behavior (Evaluation Rollout)", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
+    def append_measurments(self,prediction_error,decoding_error,world_error):
+        self.intra_episode_prediction_errors.append(prediction_error)
+        self.intra_episode_decoding_errors.append(decoding_error)
+        self.intra_episode_world_evolution_errors.append(world_error)
 
-    # Render a 2x2 grid of evaluation frames
-    x_coords = [15, 105, 15, 105]
-    y_start = pdf.get_y()
-    for i, fpath in enumerate(frame_paths):
-        y_pos = y_start if i < 2 else y_start + 55
-        pdf.image(fpath, x=x_coords[i], y=y_pos, w=85)
+    def append_sleep(self,actor_loss,entropy_bonus):
+        self.episode_actor_loss.append(actor_loss)
+        self.episode_entropy_loss.append(entropy_bonus)
+        
+    def end_episode(self,real_reward):
+        self.episode_prediction_errors.append(self.intra_episode_prediction_errors)
+        self.episode_decoding_errors.append(self.intra_episode_decoding_errors)
+        self.episode_world_evolution_errors.append(self.intra_episode_world_evolution_errors)
+        self.rewards.append(real_reward)
 
-    pdf.output(filename)
 
-    # Clean up temporary image files
-    os.remove(plot_path)
-    for fpath in frame_paths:
-        if os.path.exists(fpath):
-            os.remove(fpath)
+    def render_pdf(self, eval_frames=None, filename="error_tracking_report.pdf"):
+        """
+        Assembles everything this class has tracked into one PDF:
+        the reward curve, plus a red(early)->blue(late) trend plot for
+        each of the three intra-episode error series, plus (optionally)
+        a grid of evaluation frames if you pass some in.
+        """
+        sections = []  # (heading, image_path, caption) in render order
+ 
+        if self.rewards:
+            reward_plot = plot_reward_curve(self.rewards, save_path="temp_rewards.png")
+            sections.append(("Learning Performance", reward_plot, None))
+ 
+        error_series = [
+            ("Prediction Error Trend", self.episode_prediction_errors,
+             "Reward/next-state prediction error", "temp_prediction_error.png"),
+            ("Decoding Error Trend", self.episode_decoding_errors,
+             "Decoding (reconstruction) error", "temp_decoding_error.png"),
+            ("World Evolution Error Trend", self.episode_world_evolution_errors,
+             "World-evolution (dynamics) error", "temp_world_error.png"),
+            ("Entropy Error Trend", self.episode_entropy_loss,
+              "Entropy error evolution", "temp_entropy.png"),
+            ("Actor Loss Trend", self.episode_actor_loss,
+             "Actor loss evolution", "temp_actor_loss.png")
+        ]
+        caption = ("Each line is one episode's error over its steps. Color moves from "
+                   "red (earliest episodes) to blue (latest episodes) to reveal whether "
+                   "error is shrinking across training.")
+        for heading, series, ylabel, path in error_series:
+            if not series:
+                continue
+            plot_path = plot_metric_trend(
+                series, title=heading, ylabel=ylabel, save_path=path,
+            )
+            sections.append((heading, plot_path, caption))
+ 
+        # Optional evaluation frames, reusing the same 2x2 grid logic
+        # generate_pdf_report uses.
+        frame_paths = []
+        if eval_frames:
+            step_size = max(1, len(eval_frames) // 4)
+            for idx, frame in enumerate(eval_frames[::step_size][:4]):
+                img_path = f"temp_frame_{idx}.png"
+                if isinstance(frame, np.ndarray):
+                    if frame.dtype != np.uint8:
+                        frame = (frame * 255).astype(np.uint8)
+                    Image.fromarray(frame).save(img_path)
+                frame_paths.append(img_path)
+ 
+        pdf = FPDF()
+        pdf.add_page()
+ 
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.cell(0, 10, "Brain Model Error Tracking Report", new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(5)
+ 
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 6, f"Total Episodes: {len(self.rewards)}", new_x="LMARGIN", new_y="NEXT")
+        if self.rewards:
+            pdf.cell(0, 6, f"Final Reward: {self.rewards[-1]:.2f}", new_x="LMARGIN", new_y="NEXT")
+            pdf.cell(0, 6, f"Peak Reward: {max(self.rewards):.2f}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(5)
+ 
+        for i, (heading, image_path, section_caption) in enumerate(sections, start=1):
+            if i > 1:
+                pdf.add_page()
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.cell(0, 8, f"{i}. {heading}", new_x="LMARGIN", new_y="NEXT")
+            if section_caption:
+                pdf.ln(2)
+                pdf.set_font("Helvetica", "", 10)
+                pdf.multi_cell(0, 5, section_caption)
+            pdf.ln(2)
+            pdf.image(image_path, x=15, w=180)
+ 
+        if frame_paths:
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.cell(0, 8, f"{len(sections) + 1}. Replicated Behavior (Evaluation Rollout)",
+                     new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+            x_coords = [15, 105, 15, 105]
+            y_start = pdf.get_y()
+            for i, fpath in enumerate(frame_paths):
+                y_pos = y_start if i < 2 else y_start + 55
+                pdf.image(fpath, x=x_coords[i], y=y_pos, w=85)
+ 
+        pdf.output(filename)
+ 
+        # Clean up temp images
+        for _, image_path, _ in sections:
+            if os.path.exists(image_path):
+                os.remove(image_path)
+        for fpath in frame_paths:
+            if os.path.exists(fpath):
+                os.remove(fpath)
 
 ## The world is an abstraction over what our agents can see:
 # the way I see this is that we can observe the world, get rewards, etc
@@ -191,6 +322,10 @@ class Memory:
     def random_long_term_memory(self) :
         return random.sample(self.long_term, 1)[0]
 
+    def __len__(self):
+        return len(self.long_term)
+
+
 ## The conv encoder is supposed to be a backbone 
 # of some YOLO famous network, the goal is that this is a 
 # thing that generates an embbedding of the world
@@ -267,6 +402,9 @@ class Projection(nn.Module):
         for param in self.parameters():
             param.requires_grad = True   
 
+## The cortex is the magic center, it takes the attention, 
+# memories, protomemory and generates an action
+
 class Cortex(nn.Module):
     def __init__(self, d_model, n_actions):
         super().__init__()
@@ -308,8 +446,38 @@ class RewardCenter(nn.Module):
             param.requires_grad = True   
 
 class DreamerCenter(nn.Module):
-    def __init__(self, d_model):
-        pass
+    def __init__(self, d_model=32, n_actions=2, action_dim=16, hidden_dim=128):
+        super().__init__()
+        self.d_model = d_model
+        self.action_embed = nn.Embedding(n_actions, action_dim)
+        
+        input_dim = d_model + action_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model)  # Outputs delta_z
+        )
+ 
+    def forward(self, z, action):
+        single = z.dim() == 1
+        if single:
+            z = z.unsqueeze(0)
+        if action.dim() == 0:
+            action = action.unsqueeze(0)
+ 
+        a_emb = self.action_embed(action)
+ 
+        x = torch.cat([z, a_emb], dim=-1)
+
+        delta_z = self.net(x)
+        z_next = z + delta_z
+ 
+        return z_next.squeeze(0) if single else z_next
+
 
     def freeze_weights(self):
         for param in self.parameters():
@@ -317,7 +485,7 @@ class DreamerCenter(nn.Module):
 
     def activate_weights(self):
         for param in self.parameters():
-            param.requires_grad = True  
+            param.requires_grad = True   
 
 class Agent(nn.Module):
     def __init__(self, world, d_model=32, num_heads=2, lr=1e-3, gamma=0.99, entropy_coef=0.01):
@@ -334,14 +502,14 @@ class Agent(nn.Module):
         self.dreamer = DreamerCenter(d_model, world.n_actions) # Expects (z, action)
         self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
         
-        self.cortex = Cortex(d_model * 2, world.n_actions)
-        self.reward_center = RewardCenter(d_model * 2)
+        self.cortex = Cortex(d_model, world.n_actions)
+        self.reward_center = RewardCenter(d_model)
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
     def waking_up(self):
         self.cortex.freeze_weights()
-        self.dreamer.freeze_weights()
+        self.dreamer.activate_weights()
         self.reward_center.activate_weights()
         self.perception.activate_weights()
         self.decoder.activate_weights()
@@ -360,27 +528,31 @@ class Agent(nn.Module):
             attended = torch.zeros_like(protomemory)
 
         fused = torch.cat([protomemory, attended], dim=-1)
-        action = self.cortex(fused)
+        action_logits = self.cortex(fused)
         predicted_reward = self.reward_center(fused)
         recreated_world_view = self.decoder(protomemory)
-        
-        # Pass state + action to dreamer
+
+        dist = torch.distributions.Categorical(logits=action_logits)
+        action = dist.sample()
+
         predicted_next_embedding = self.dreamer(protomemory.detach(), action.detach())
 
-        return action.detach(), predicted_reward, recreated_world_view, protomemory.detach(), predicted_next_embedding
+        return (action_logits.detach(), action.detach(), predicted_reward,
+                recreated_world_view, protomemory.detach(), predicted_next_embedding)
+
 
     def going_to_sleep(self):
         self.cortex.activate_weights()
-        self.dreamer.activate_weights()
+        self.dreamer.freeze_weights()
         self.reward_center.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
         self.is_asleep = True
 
-    def sleep(self, number_of_dreams):
+    def sleep(self, number_of_dreams, error_reporting):
         log_probs, predicted_rewards, rewards, entropies = [], [], [], []
         mem_snap = self.memory.snapshot()
-        dream = self.memory.random_long_term_memory()
+        dream = self.memory.random_long_term_memory().proto
 
         for i in range(number_of_dreams):
             query = dream.unsqueeze(0).unsqueeze(0) 
@@ -400,7 +572,6 @@ class Agent(nn.Module):
 
             predicted_reward = self.reward_center(fused)
             
-            # Roll forward in latent space using dreamer
             dream = self.dreamer(dream, action)
 
             log_probs.append(dist.log_prob(action))
@@ -424,9 +595,10 @@ class Agent(nn.Module):
         entropies_t = torch.stack(entropies)
 
         actor_loss = -(log_probs_t * advantages).mean()
-        critic_loss = F.mse_loss(values_t, returns)
         entropy_bonus = entropies_t.mean()
-        loss = actor_loss + 0.5 * critic_loss - self.entropy_coef * entropy_bonus
+        loss = actor_loss - self.entropy_coef * entropy_bonus
+
+        error_reporting.append_sleep(actor_loss.detach(),entropy_bonus.detach())
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -436,221 +608,84 @@ class Agent(nn.Module):
     def remember(self, proto, action, reward, reward_prediction_error):
         self.memory.add(Association(proto, action, reward, reward_prediction_error))
 
-def train(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=20,render=False):
-    world = World("CartPole-v1", render=render)
-    brain = Brain(world)
-
-    optimizer = torch.optim.Adam(brain.parameters(), lr=lr)
- 
-    episode_rewards = []
- 
-    for episode in range(num_episodes):
-        world.reset()
-        done = False
-        ep_reward = 0.0
-        log_probs, predicted_rewards, rewards, entropies = [], [], [], []
- 
-        while not done:
-            viewed_world = world.observe()
-            action, predicted_reward, protomemory = brain(viewed_world)
- 
-            dist = torch.distributions.Categorical(logits=action)
-            action = dist.sample()
- 
-            next_obs, reward, done, _ = world.act(action.item())
- 
-            log_probs.append(dist.log_prob(action))
-            predicted_rewards.append(predicted_reward)
-            rewards.append(reward)
-            entropies.append(dist.entropy())
- 
-            # crude "surprise" signal used purely to decide what's worth
-            # remembering; the real learning signal is the loss below
-            reward_prediction_error = reward - predicted_reward.item()
-            brain.remember(proto=protomemory, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
- 
-            ep_reward += reward
- 
-        # ---- discounted returns and advantages ----
-        returns = []
-        R = 0.0
-        for r in reversed(rewards):
-            R = r + gamma * R
-            returns.insert(0, R)
-
-        returns = torch.tensor(returns, dtype=torch.float32)
-        values_t = torch.stack(predicted_rewards)
-        advantages = returns - values_t.detach()
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
- 
-        log_probs_t = torch.stack(log_probs)
-        entropies_t = torch.stack(entropies)
- 
-        actor_loss = -(log_probs_t * advantages).mean()
-        critic_loss = F.mse_loss(values_t, returns)
-        entropy_bonus = entropies_t.mean()
-        loss = actor_loss + 0.5 * critic_loss - entropy_coef * entropy_bonus
- 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(brain.parameters(), max_norm=1.0)
-        optimizer.step()
- 
-        episode_rewards.append(ep_reward)
-        if (episode + 1) % log_every == 0:
-            avg = np.mean(episode_rewards[-log_every:])
-            print(f"Episode {episode + 1:4d} | avg reward (last {log_every}): {avg:.1f}")
- 
-    return brain, episode_rewards
-
-
-def train_single(num_episodes=1000, gamma=0.99, lr=1e-3, entropy_coef=0.01, log_every=20, render=False):
-    world = World("CartPole-v1", render=render)
-    brain = Brain(world)
-    optimizer = torch.optim.Adam(brain.parameters(), lr=lr)
- 
-    episode_rewards = []
- 
-    for episode in range(num_episodes):
-        world.reset()
-        done = False
-        ep_reward = 0.0
- 
-        while not done:
-            viewed_world = world.observe()
-            action_logits, value, protomemory = brain(viewed_world)
- 
-            dist = torch.distributions.Categorical(logits=action_logits)
-            action = dist.sample()
- 
-            _, reward, done, _ = world.act(action.item())
-            ep_reward += reward
-
-            # --- 1. Compute 1-Step TD Target & Advantage ---
-            if done:
-                next_value = torch.tensor(0.0)
-            else:
-                with torch.no_grad():
-                    next_view = world.observe()
-                    _, next_value, _ = brain(next_view)
-
-            target = reward + gamma * next_value
-            advantage = (target - value).detach()
-
-            # --- 2. Step-Level Loss Computation ---
-            actor_loss = -dist.log_prob(action) * advantage
-            critic_loss = F.mse_loss(value.unsqueeze(0), target.unsqueeze(0))
-            entropy_bonus = dist.entropy()
-
-            p = episode / num_episodes
-
-            # Linear schedules
-            w_recon  = max(0.05, 1.0 - p)        # Decays from 1.0 down to 0.05
-            w_critic = min(0.5, 0.1 + 0.4 * p)   # Increases from 0.1 up to 0.5
-            w_actor  = min(1.0, 0.05 + 0.95 * p) # Increases from 0.05 up to 1.0
-
-            # Calculate total loss for current step
-            recon_loss = F.mse_loss(brain.reconstruct(protomemory), viewed_world)
-            loss = (w_recon * recon_loss) + (w_actor * actor_loss) + (w_critic * critic_loss) - (entropy_coef * entropy_bonus)
-
-            # --- 3. Immediate Gradient Update ---
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(brain.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            # --- 4. Store Memory ---
-            brain.remember(
-                proto=protomemory, 
-                action=action.item(), 
-                reward=reward, 
-                reward_prediction_error=advantage.item()
-            )
- 
-        episode_rewards.append(ep_reward)
-        if (episode + 1) % log_every == 0:
-            avg = np.mean(episode_rewards[-log_every:])
-            print(f"Episode {episode + 1:4d} | avg reward (last {log_every}): {avg:.1f}")
- 
-    return brain, episode_rewards
+    def freeze_all(self):
+        self.cortex.freeze_weights()
+        self.dreamer.freeze_weights()
+        self.reward_center.freeze_weights()
+        self.perception.freeze_weights()
+        self.decoder.freeze_weights()
 
 def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=False):
     world = World("CartPole-v1", render=render)
     agent = Agent(world, d_model=32, lr=lr)
-
-    episode_rewards = []
-
+    error_tracker = ErrorTracking()
+ 
     for episode in range(num_episodes):
-        # ====================================================
-        # PHASE 1: AWAKE PHASE (Environment & World Model)
-        # ====================================================
         agent.waking_up()
-
+        error_tracker.start_episode()
+ 
         awake_optimizer = torch.optim.Adam(
             filter(lambda p: p.requires_grad, agent.parameters()), lr=lr
         )
-
+ 
         world.reset()
         done = False
         ep_reward = 0.0
 
         while not done:
             viewed_world = world.observe()
-
-            # 1. Perception forward pass
-            action_logits, pred_reward, recon_world, proto, pred_next_proto = agent.awake_cycle(viewed_world)
-
-            # 2. Sample action & step environment
-            dist = torch.distributions.Categorical(logits=action_logits)
-            action = dist.sample()
-            next_obs, reward, done, _ = world.act(action.item())
-
+ 
+            (action_logits, action, pred_reward, recon_world,
+             proto, pred_next_proto) = agent.awake_cycle(viewed_world)
+ 
+            _, reward, done, _ = world.act(action.item())
+ 
             # 3. Compute ground truth target for next frame's embedding
+            # (world.act() already updated world.world_frame; observe() is
+            # what turns that into the same kind of tensor perception expects)
+            next_obs = world.observe()
             with torch.no_grad():
                 next_proto_target = agent.perception(next_obs)
-
-            # 4. Compute World Model losses
+ 
             recon_loss = F.mse_loss(recon_world, viewed_world)
             reward_loss = F.mse_loss(pred_reward.squeeze(), torch.tensor(reward, dtype=torch.float32))
             dynamics_loss = F.mse_loss(pred_next_proto, next_proto_target)
-
+ 
             awake_loss = recon_loss + reward_loss + dynamics_loss
+            error_tracker.append_measurments(prediction_error=reward_loss.detach(),
+                                            decoding_error=recon_loss.detach(),
+                                            world_error=dynamics_loss.detach())
 
             # 5. Backpropagate & step perception/world model weights
             awake_optimizer.zero_grad()
             awake_loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
             awake_optimizer.step()
-
-            # 6. Save association snapshot into memory
-            reward_prediction_error = abs(reward - pred_reward.item())
+ 
             agent.remember(
                 proto=proto,
                 action=action.item(),
                 reward=reward,
-                reward_prediction_error=reward_prediction_error
+                reward_prediction_error=abs(reward - pred_reward.item())
             )
-
+ 
             ep_reward += reward
 
-        episode_rewards.append(ep_reward)
+        error_tracker.end_episode(ep_reward)
+        agent.going_to_sleep()
 
-        # ====================================================
-        # PHASE 2: SLEEP PHASE (Imagination & Policy Optimization)
-        # ====================================================
         if len(agent.memory) > 0:
-            agent.going_to_sleep()
-            agent.sleep(number_of_dreams=number_of_dreams)
+            for _ in range(number_of_dreams):
+                agent.sleep(number_of_dreams=20,error_reporting=error_tracker)
 
-        # Logging
         if (episode + 1) % log_every == 0:
-            avg = np.mean(episode_rewards[-log_every:])
+            avg = np.mean(error_tracker.rewards[-log_every:])
             print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
-
-    return agent, episode_rewards
  
-def watch(brain, num_episodes=100, greedy=True, render=True):
+    return agent, error_tracker
+
+ 
+def watch(agent, num_episodes=100, render=True):
     world = World("CartPole-v1", render=render)
     captured_frames = []
     for episode in range(num_episodes):
@@ -660,14 +695,12 @@ def watch(brain, num_episodes=100, greedy=True, render=True):
         while not done:
             obs_t = world.observe()
             with torch.no_grad():
-                logits, value, proto = brain(obs_t)
-            dist = torch.distributions.Categorical(logits=logits)
-            action = torch.argmax(logits) if greedy else dist.sample()
- 
+                (action_logits, action, pred_reward, recon_world,proto, pred_next_proto) = agent.awake_cycle(obs_t)
+            action = torch.argmax(action_logits)
             next_obs, reward, done, _ = world.act(action.item())
             captured_frames.append(world.env.render())
-            reward_prediction_error = reward - value.item()
-            brain.remember(proto=proto, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
+            reward_prediction_error = reward - pred_reward.item()
+            agent.remember(proto=proto, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
  
             ep_reward += reward
         print(f"[watch] Episode {episode + 1}: reward = {ep_reward:.0f}")
@@ -677,10 +710,10 @@ def watch(brain, num_episodes=100, greedy=True, render=True):
  
  
 if __name__ == "__main__":
-    # Train headless (fast), then pop open a window to watch the result.
-    # Flip to obs_type="pixels" to make the same Brain code learn from
-    # raw frames instead of CartPole's hand-crafted 4-number state.
-    trained_brain, rewards = train_single(num_episodes=500, render=False)
-    captured_frames = watch(trained_brain, num_episodes=3, render=True)
-    generate_pdf_report(rewards,captured_frames)
-    
+    # The loop is simple:
+    # we train it for a number of episodes
+    trained_brain, error_tracker = train(num_episodes=500, render=False)
+    trained_brain.freeze_all()
+    # we then just force the brain to move in the world
+    captured_frames = watch(trained_brain, num_episodes=10, render=True)
+    error_tracker.render_pdf(captured_frames)    
