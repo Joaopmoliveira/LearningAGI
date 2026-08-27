@@ -377,7 +377,7 @@ class Projection(nn.Module):
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(c, 16, kernel_size=4, stride=2), nn.ReLU(),
             nn.ConvTranspose2d(16, encoder.in_channels, kernel_size=8, stride=4),
-            nn.Sigmoid(),  # outputs land in [0, 1], matching the normalized frames
+            nn.Sigmoid(), 
         )
  
     def forward(self, latent):
@@ -425,7 +425,7 @@ class Cortex(nn.Module):
         for param in self.parameters():
             param.requires_grad = True   
  
-class RewardCenter(nn.Module):
+class ValueCenter(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.net = nn.Sequential(
@@ -450,33 +450,37 @@ class DreamerCenter(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.action_embed = nn.Embedding(n_actions, action_dim)
-        
+
         input_dim = d_model + action_dim
-        self.net = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, d_model)  # Outputs delta_z
         )
+        self.next_state_head = nn.Linear(hidden_dim, d_model)   # delta_z
+        self.reward_head = nn.Linear(hidden_dim, 1)             # predicted reward
  
+
     def forward(self, z, action):
         single = z.dim() == 1
         if single:
             z = z.unsqueeze(0)
         if action.dim() == 0:
             action = action.unsqueeze(0)
- 
-        a_emb = self.action_embed(action)
- 
-        x = torch.cat([z, a_emb], dim=-1)
 
-        delta_z = self.net(x)
+        a_emb = self.action_embed(action)
+        h = self.trunk(torch.cat([z, a_emb], dim=-1))
+
+        delta_z = self.next_state_head(h)
         z_next = z + delta_z
- 
-        return z_next.squeeze(0) if single else z_next
+        reward_pred = self.reward_head(h).squeeze(-1)
+
+        if single:
+            return z_next.squeeze(0), reward_pred.squeeze(0)
+        return z_next, reward_pred
 
 
     def freeze_weights(self):
@@ -503,14 +507,14 @@ class Agent(nn.Module):
         self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
         
         self.cortex = Cortex(d_model, world.n_actions)
-        self.reward_center = RewardCenter(d_model)
+        self.value_center = ValueCenter(d_model)
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
     def waking_up(self):
         self.cortex.freeze_weights()
         self.dreamer.activate_weights()
-        self.reward_center.activate_weights()
+        self.value_center.activate_weights()
         self.perception.activate_weights()
         self.decoder.activate_weights()
         self.is_asleep = False
@@ -529,33 +533,48 @@ class Agent(nn.Module):
 
         fused = torch.cat([protomemory, attended], dim=-1)
         action_logits = self.cortex(fused)
-        predicted_reward = self.reward_center(fused)
+        predicted_value = self.value_center(fused)
         recreated_world_view = self.decoder(protomemory)
 
         dist = torch.distributions.Categorical(logits=action_logits)
         action = dist.sample()
 
-        predicted_next_embedding = self.dreamer(protomemory.detach(), action.detach())
+        predicted_next_embedding,predicted_reward = self.dreamer(protomemory.detach(), action.detach())
 
-        return (action_logits.detach(), action.detach(), predicted_reward,
+        return (action_logits.detach(), action.detach(), predicted_value, predicted_reward,
                 recreated_world_view, protomemory.detach(), predicted_next_embedding)
 
+    @torch.no_grad()
+    def get_value(self, worldview):
+        proto = self.perception(worldview)
+        mem_snap = self.memory.snapshot()
+        
+        if mem_snap is not None:
+            query = proto.unsqueeze(0).unsqueeze(0)
+            kv = mem_snap.unsqueeze(0)
+            attended, _ = self.attention(query, kv, kv)
+            attended = attended.squeeze(0).squeeze(0)
+        else:
+            attended = torch.zeros_like(proto)
+
+        fused = torch.cat([proto, attended], dim=-1)
+        return self.value_center(fused).squeeze()
 
     def going_to_sleep(self):
         self.cortex.activate_weights()
         self.dreamer.freeze_weights()
-        self.reward_center.freeze_weights()
+        self.value_center.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
         self.is_asleep = True
 
     def sleep(self, number_of_dreams, error_reporting):
-        log_probs, predicted_rewards, rewards, entropies = [], [], [], []
+        log_probs, values, rewards, entropies = [], [], [], []
         mem_snap = self.memory.snapshot()
         dream = self.memory.random_long_term_memory().proto
 
         for i in range(number_of_dreams):
-            query = dream.unsqueeze(0).unsqueeze(0) 
+            query = dream.unsqueeze(0).unsqueeze(0)
 
             if mem_snap is not None:
                 kv = mem_snap.unsqueeze(0)
@@ -570,23 +589,33 @@ class Agent(nn.Module):
             dist = torch.distributions.Categorical(logits=action_logits)
             action = dist.sample()
 
-            predicted_reward = self.reward_center(fused)
-            
-            dream = self.dreamer(dream, action)
+            predicted_value = self.value_center(fused)      # baseline for THIS state
+            dream, predicted_reward = self.dreamer(dream, action)
 
             log_probs.append(dist.log_prob(action))
-            predicted_rewards.append(predicted_reward)
-            rewards.append(predicted_reward.detach()) # Use predicted reward in dreams
+            values.append(predicted_value.squeeze())
+            rewards.append(predicted_reward.detach())        # reward still drives the return
             entropies.append(dist.entropy())
 
-        # ---- Discounted returns & Advantage calculation ----
-        returns, R = [], 0.0
+        # ---- Bootstrap the final imagined state instead of just summing rewards ----
+        with torch.no_grad():
+            query = dream.unsqueeze(0).unsqueeze(0)
+            if mem_snap is not None:
+                kv = mem_snap.unsqueeze(0)
+                attended, _ = self.attention(query, kv, kv)
+                attended = attended.squeeze(0).squeeze(0)
+            else:
+                attended = torch.zeros_like(dream)
+            final_fused = torch.cat([dream, attended], dim=-1)
+            R = self.value_center(final_fused).squeeze()
+
+        returns = []
         for r in reversed(rewards):
             R = r + self.gamma * R
             returns.insert(0, R)
 
-        returns = torch.tensor(returns, dtype=torch.float32)
-        values_t = torch.stack(predicted_rewards).squeeze()
+        returns = torch.stack(returns) if torch.is_tensor(returns[0]) else torch.tensor(returns, dtype=torch.float32)
+        values_t = torch.stack(values)
         advantages = returns - values_t.detach()
         if advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -611,7 +640,7 @@ class Agent(nn.Module):
     def freeze_all(self):
         self.cortex.freeze_weights()
         self.dreamer.freeze_weights()
-        self.reward_center.freeze_weights()
+        self.value_center.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
 
@@ -635,23 +664,25 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
         while not done:
             viewed_world = world.observe()
  
-            (action_logits, action, pred_reward, recon_world,
-             proto, pred_next_proto) = agent.awake_cycle(viewed_world)
+            (action_logits, action, predicted_value, predicted_reward,
+                recreated_world_view, protomemory, predicted_next_embedding) = agent.awake_cycle(viewed_world)
  
             _, reward, done, _ = world.act(action.item())
- 
-            # 3. Compute ground truth target for next frame's embedding
-            # (world.act() already updated world.world_frame; observe() is
-            # what turns that into the same kind of tensor perception expects)
             next_obs = world.observe()
+            # Get target next value using the agent's wrapper method
+            next_value = agent.get_value(next_obs).item()
+            td_target = reward + (0.0 if done else agent.gamma * next_value)
+
+
             with torch.no_grad():
                 next_proto_target = agent.perception(next_obs)
  
-            recon_loss = F.mse_loss(recon_world, viewed_world)
-            reward_loss = F.mse_loss(pred_reward.squeeze(), torch.tensor(reward, dtype=torch.float32))
-            dynamics_loss = F.mse_loss(pred_next_proto, next_proto_target)
- 
-            awake_loss = recon_loss + reward_loss + dynamics_loss
+            recon_loss = F.mse_loss(recreated_world_view, viewed_world)
+            reward_loss = F.mse_loss(predicted_reward, torch.tensor(reward, dtype=torch.float32))
+            dynamics_loss = F.mse_loss(predicted_next_embedding, next_proto_target)
+            value_loss = F.mse_loss(predicted_value.squeeze(), torch.tensor(td_target, dtype=torch.float32))
+
+            awake_loss = recon_loss + reward_loss + dynamics_loss + value_loss
             error_tracker.append_measurments(prediction_error=reward_loss.detach(),
                                             decoding_error=recon_loss.detach(),
                                             world_error=dynamics_loss.detach())
@@ -661,12 +692,12 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
             awake_loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
             awake_optimizer.step()
- 
+
             agent.remember(
-                proto=proto,
+                proto=protomemory,
                 action=action.item(),
                 reward=reward,
-                reward_prediction_error=abs(reward - pred_reward.item())
+                reward_prediction_error=abs(reward - predicted_reward.item())
             )
  
             ep_reward += reward
