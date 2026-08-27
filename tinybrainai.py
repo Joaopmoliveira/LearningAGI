@@ -94,6 +94,25 @@ def plot_reward_curve(rewards, save_path="temp_reward_plot.png", moving_avg_wind
     return save_path
 
 
+def plot_simple_series_curve(series, label, title, save_path="temp_reward_plot.png",):
+    """
+    Flat (not list-of-lists) reward-per-episode curve, with an optional
+    moving average overlay. Factored out of generate_pdf_report so
+    ErrorTracking.render_pdf can reuse the exact same plot.
+    """
+    plt.figure(figsize=(6, 3))
+    plt.plot(series, label=label, color="#2b5c8f", alpha=0.6)
+ 
+    plt.title(title)
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    return save_path
+
 class ErrorTracking:
     def __init__(self):
         self.rewards = []
@@ -148,12 +167,14 @@ class ErrorTracking:
             ("Decoding Error Trend", self.episode_decoding_errors,
              "Decoding (reconstruction) error", "temp_decoding_error.png"),
             ("World Evolution Error Trend", self.episode_world_evolution_errors,
-             "World-evolution (dynamics) error", "temp_world_error.png"),
-            ("Entropy Error Trend", self.episode_entropy_loss,
-              "Entropy error evolution", "temp_entropy.png"),
-            ("Actor Loss Trend", self.episode_actor_loss,
-             "Actor loss evolution", "temp_actor_loss.png")
+             "World-evolution (dynamics) error", "temp_world_error.png")
         ]
+
+        path = plot_simple_series_curve(self.episode_entropy_loss,"Entropy error evolution","Entropy Error Trend","temp_entropy.png")
+        sections.append(("Entropy Performance", path, None))
+        path = plot_simple_series_curve(self.episode_actor_loss,"Actor loss evolution","Actor Loss Trend","temp_actor_loss.png")
+        sections.append(("Actor Performance", path, None))
+
         caption = ("Each line is one episode's error over its steps. Color moves from "
                    "red (earliest episodes) to blue (latest episodes) to reveal whether "
                    "error is shrinking across training.")
@@ -513,8 +534,8 @@ class Agent(nn.Module):
 
     def waking_up(self):
         self.cortex.freeze_weights()
+        self.value_center.freeze_weights()
         self.dreamer.activate_weights()
-        self.value_center.activate_weights()
         self.perception.activate_weights()
         self.decoder.activate_weights()
         self.is_asleep = False
@@ -562,13 +583,13 @@ class Agent(nn.Module):
 
     def going_to_sleep(self):
         self.cortex.activate_weights()
+        self.value_center.activate_weights()
         self.dreamer.freeze_weights()
-        self.value_center.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
         self.is_asleep = True
 
-    def sleep(self, number_of_dreams, error_reporting):
+    def sleep(self, number_of_dreams):
         log_probs, values, rewards, entropies = [], [], [], []
         mem_snap = self.memory.snapshot()
         dream = self.memory.random_long_term_memory().proto
@@ -627,12 +648,12 @@ class Agent(nn.Module):
         entropy_bonus = entropies_t.mean()
         loss = actor_loss - self.entropy_coef * entropy_bonus
 
-        error_reporting.append_sleep(actor_loss.detach(),entropy_bonus.detach())
-
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizer.step()
+
+        return actor_loss.detach(),entropy_bonus.detach()
 
     def remember(self, proto, action, reward, reward_prediction_error):
         self.memory.add(Association(proto, action, reward, reward_prediction_error))
@@ -706,9 +727,14 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
         agent.going_to_sleep()
 
         if len(agent.memory) > 0:
-            for _ in range(number_of_dreams):
-                agent.sleep(number_of_dreams=20,error_reporting=error_tracker)
-
+            actor_loss_list = 0
+            entropy_bonus_list = 0 
+            for _ in range(20):
+                actor_loss,entropy_bonus = agent.sleep(number_of_dreams=5)
+                actor_loss_list += actor_loss
+                entropy_bonus_list += entropy_bonus
+            actor_loss_list
+            error_tracker.append_sleep(actor_loss_list,entropy_bonus_list)
         if (episode + 1) % log_every == 0:
             avg = np.mean(error_tracker.rewards[-log_every:])
             print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
@@ -726,12 +752,13 @@ def watch(agent, num_episodes=100, render=True):
         while not done:
             obs_t = world.observe()
             with torch.no_grad():
-                (action_logits, action, pred_reward, recon_world,proto, pred_next_proto) = agent.awake_cycle(obs_t)
+                (action_logits, action, predicted_value, predicted_reward,
+                                recreated_world_view, protomemory, predicted_next_embedding) = agent.awake_cycle(obs_t)
             action = torch.argmax(action_logits)
             next_obs, reward, done, _ = world.act(action.item())
             captured_frames.append(world.env.render())
-            reward_prediction_error = reward - pred_reward.item()
-            agent.remember(proto=proto, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
+            reward_prediction_error = reward - predicted_reward.item()
+            agent.remember(proto=protomemory, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
  
             ep_reward += reward
         print(f"[watch] Episode {episode + 1}: reward = {ep_reward:.0f}")
@@ -743,8 +770,8 @@ def watch(agent, num_episodes=100, render=True):
 if __name__ == "__main__":
     # The loop is simple:
     # we train it for a number of episodes
-    trained_brain, error_tracker = train(num_episodes=500, render=False)
+    trained_brain, error_tracker = train(num_episodes=100, render=False)
     trained_brain.freeze_all()
     # we then just force the brain to move in the world
-    captured_frames = watch(trained_brain, num_episodes=10, render=True)
+    captured_frames = watch(trained_brain, num_episodes=3, render=True)
     error_tracker.render_pdf(captured_frames)    
