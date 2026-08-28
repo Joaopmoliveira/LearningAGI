@@ -20,12 +20,12 @@ def plot_metric_trend(list_of_lists, title, ylabel, save_path,
                        early_color="red", late_color="blue",
                        xlabel="Step within episode", legend_label="Episode"):
     """
-    Generic version of the earlier reward-error plot: takes ANY list of
+    Generic version of the reward-error plot: takes ANY list of
     lists (outer index = episode, inner list = a per-step metric for
     that episode) and plots every episode's curve on one axes, colored
     on a gradient from `early_color` (earliest episodes) to `late_color`
     (latest episodes). Used for prediction error, decoding error, and
-    world-evolution error alike -- only the title/ylabel differ.
+    world-evolution error alike.
     """
     n_epochs = len(list_of_lists)
     if n_epochs == 0:
@@ -54,21 +54,7 @@ def plot_metric_trend(list_of_lists, title, ylabel, save_path,
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
     plt.close()
-    return save_path
- 
- 
-def plot_reward_error_trends(reward_error_history, save_path="temp_rpe_trend.png",
-                              early_color="red", late_color="blue"):
-    """Thin wrapper kept for backwards compatibility -- see plot_metric_trend."""
-    return plot_metric_trend(
-        reward_error_history,
-        title="Reward Prediction Error per Step, Across Training",
-        ylabel="Reward Prediction Error",
-        save_path=save_path,
-        early_color=early_color,
-        late_color=late_color,
-    )
- 
+    return save_path 
  
 def plot_reward_curve(rewards, save_path="temp_reward_plot.png", moving_avg_window=20):
     """
@@ -112,6 +98,8 @@ def plot_simple_series_curve(series, label, title, save_path="temp_reward_plot.p
     plt.savefig(save_path, dpi=200)
     plt.close()
     return save_path
+
+
 
 class ErrorTracking:
     def __init__(self):
@@ -332,7 +320,7 @@ class Memory(nn.Module):
         self.query_long_memories = query_long_memories
         self.d_model = d_model
         self.n_actions = n_actions
-
+ 
     def add(self, transition):
         self.short_term.append(transition)
         if len(self.long_term) < self.long_capacity:
@@ -342,24 +330,47 @@ class Memory(nn.Module):
             if abs(transition.reward_prediction_error) > abs(self.long_term[min_idx].reward_prediction_error):
                 self.long_term[min_idx] = transition
 
-    def retrieve(self, query_proto):
-        memories = {"short":{}, "long":{}}
-         
-        pad_size = self.query_short_memories - len(self.short_term)
-        if pad_size < 0 : pad_size = 0
-        memories["short"]["protos"] = torch.cat([[sel_proto.proto for sel_proto in self.short_term], torch.zeros(pad_size, self.d_model)], dim=0)
-        memories["short"]["actions"] = torch.cat([[sel_proto.action for sel_proto in self.short_term], torch.zeros(pad_size, dtype=torch.long)], dim=0)
-        memories["short"]["rewards"] = torch.cat([[sel_proto.reward for sel_proto in self.short_term], torch.zeros(pad_size, 1)], dim=0)
+    def _stack_or_empty(self, items, width=None):
+        if not items:
+            return torch.zeros(0, width) if width is not None else torch.zeros(0, dtype=torch.long)
+        return torch.stack(items) if torch.is_tensor(items[0]) else torch.tensor(items)
 
-        if len(self.long_term) <=  self.query_long_memories:
+    def retrieve(self, query_proto):
+        """
+        The retrieved memories are a dictionary composed of short term and long term memories.
+        Short term memories are just compacted sequencially, while long term memories are selected by
+        the an attention network to retrieve the most important memories for this particular moment.
+        """
+        memories = {"short": {}, "long": {}}
+
+        short_items = list(self.short_term)[-self.query_short_memories:]
+        pad_size = max(0, self.query_short_memories - len(short_items))
+ 
+        short_protos = self._stack_or_empty([t.proto for t in short_items], width=self.d_model)
+        short_actions = self._stack_or_empty([t.action for t in short_items])
+        short_rewards = self._stack_or_empty([t.reward for t in short_items], width=1)
+        if short_rewards.dim() == 1 and short_rewards.numel() > 0:
+            short_rewards = short_rewards.unsqueeze(-1)
+ 
+        memories["short"]["protos"] = torch.cat([torch.zeros(pad_size, self.d_model), short_protos], dim=0)
+        memories["short"]["actions"] = torch.cat([torch.zeros(pad_size, dtype=torch.long), short_actions.long()], dim=0)
+        memories["short"]["rewards"] = torch.cat([torch.zeros(pad_size, 1), short_rewards], dim=0)
+ 
+        if len(self.long_term) <= self.query_long_memories:
             pad_size = self.query_long_memories - len(self.long_term)
-            memories["long"]["protos"] = torch.cat([[sel_proto.proto for sel_proto in self.long_term], torch.zeros(pad_size, self.d_model)], dim=0)
-            memories["long"]["actions"] = torch.cat([[sel_proto.action for sel_proto in self.long_term], torch.zeros(pad_size, dtype=torch.long)], dim=0)
-            memories["long"]["rewards"] = torch.cat([[sel_proto.reward for sel_proto in self.long_term], torch.zeros(pad_size, 1)], dim=0)  
+            long_protos = self._stack_or_empty([t.proto for t in self.long_term], width=self.d_model)
+            long_actions = self._stack_or_empty([t.action for t in self.long_term])
+            long_rewards = self._stack_or_empty([t.reward for t in self.long_term], width=1)
+            if long_rewards.dim() == 1 and long_rewards.numel() > 0:
+                long_rewards = long_rewards.unsqueeze(-1)
+ 
+            memories["long"]["protos"] = torch.cat([long_protos, torch.zeros(pad_size, self.d_model)], dim=0)
+            memories["long"]["actions"] = torch.cat([long_actions.long(), torch.zeros(pad_size, dtype=torch.long)], dim=0)
+            memories["long"]["rewards"] = torch.cat([long_rewards, torch.zeros(pad_size, 1)], dim=0)
             return memories
             
         k_protos = torch.stack([t.proto for t in self.long_term]) 
-
+ 
         actions_onehot = F.one_hot(
             torch.tensor([t.action for t in self.long_term]), num_classes=self.n_actions
         ).float()      
@@ -367,15 +378,15 @@ class Memory(nn.Module):
         
         v_raw = torch.cat([k_protos, actions_onehot, rewards], dim=-1)
         v_embeds = self.v_proj(v_raw)
-
+ 
         query = query_proto.view(1, 1, self.d_model)
         key = k_protos.unsqueeze(0)
         values = v_embeds.unsqueeze(0)
-
+ 
         _, attn_weights = self.attention(query, key, values)
         attn_weights = attn_weights.squeeze(0).squeeze(0)
-
-        actual_k = min(self.query_long_memories, len(self.long_capacity))
+ 
+        actual_k = min(self.query_long_memories, len(self.long_term))
         _, top_indices = torch.topk(attn_weights, k=actual_k)
         
         memories["long"] = {
@@ -384,6 +395,7 @@ class Memory(nn.Module):
                         "rewards": torch.tensor([self.long_term[i].reward for i in top_indices], dtype=torch.float32).unsqueeze(-1)
                     }
         return memories
+
 
     def random_long_term_memory(self) :
         return random.sample(self.long_term, 1)[0]
@@ -478,66 +490,83 @@ class Projection(nn.Module):
 
 ## The cortex is the magic center, it takes the attention, 
 # memories, protomemory and generates an action
-class Cortex(nn.Module):
-    def __init__(self, d_model, n_actions, query_short_memory,query_long_memory,out_dimension):
+# Shared building block for Cortex and ValueCenter: both need to see the
+# current protomemory (the "now" state), a temporal-conv summary of the
+# short-term window (proto+action+reward per recent step -> velocity /
+# acceleration-like features), and the attention-selected long-term payload.
+# Kept as two separate instances (not shared weights) since actor and critic
+# optimize different objectives and sharing a trunk is a known source of
+# actor/critic optimization interference.
+class DualBranchHead(nn.Module):
+    def __init__(self, d_model, n_actions, query_short_memory, query_long_memory, out_dim=32):
         super().__init__()
-        fused_dim = d_model + query_long_memory * (d_model + n_actions + 1)
-        self.net = nn.Sequential(
-            nn.Linear(fused_dim, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, n_actions),
-        )
-
-        fused_dim = d_model + query_short_memory * (d_model + n_actions + 1)
+        step_dim = d_model + n_actions + 1  # proto + one-hot action + reward, per step/memory
+        assert query_short_memory >= 3, "temporal_conv needs at least 3 short-term steps (two kernel-2 convs)"
+ 
         self.temporal_conv = nn.Sequential(
-            nn.Conv1d(in_channels=d_model, out_channels=64, kernel_size=2, stride=1),
+            nn.Conv1d(in_channels=step_dim, out_channels=64, kernel_size=2, stride=1),
             nn.ReLU(),
             nn.Conv1d(in_channels=64, out_channels=32, kernel_size=2, stride=1),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(32 * (sequence_memory_length - 2), out_dim),
-            nn.ReLU()
+            nn.Linear(32 * (query_short_memory - 2), out_dim),
+            nn.ReLU(),
         )
  
-    def forward(self, fused):
-        if short_term_window.dim() == 2:
+        long_term_dim = query_long_memory * step_dim
+        self.fused_dim = d_model + out_dim + long_term_dim
+ 
+    def fuse(self, protomemory, short_term_window, long_term_payload):
+        single = protomemory.dim() == 1
+        if single:
+            protomemory = protomemory.unsqueeze(0)
             short_term_window = short_term_window.unsqueeze(0)
-        if retrieved_long_term.dim() == 2:
-            retrieved_long_term = retrieved_long_term.unsqueeze(0)
-
-        motion_features = self.working_branch(short_term_window)
-        long_term_features = retrieved_long_term.flatten(start_dim=1)
-        fused = torch.cat([motion_features, long_term_features], dim=-1)
-        return self.net(fused)
-
+            long_term_payload = long_term_payload.unsqueeze(0)
+ 
+        x = short_term_window.transpose(1, 2)     # (batch, step_dim, seq_len) for Conv1d
+        motion_features = self.temporal_conv(x)   # (batch, out_dim)
+ 
+        fused = torch.cat([protomemory, motion_features, long_term_payload], dim=-1)
+        return fused, single
+ 
     def freeze_weights(self):
         for param in self.parameters():
             param.requires_grad = False
-
+ 
     def activate_weights(self):
         for param in self.parameters():
-            param.requires_grad = True   
- 
-class ValueCenter(nn.Module):
-    def __init__(self, d_model, n_actions, number_of_memories):
-        super().__init__()
-        fused_dim = d_model + number_of_memories * (d_model + n_actions + 1)
+            param.requires_grad = True
+
+
+class Cortex(DualBranchHead):
+    def __init__(self, d_model, n_actions, query_short_memory, query_long_memory, out_dim=32):
+        super().__init__(d_model, n_actions, query_short_memory, query_long_memory, out_dim)
         self.net = nn.Sequential(
-            nn.Linear(fused_dim, d_model),
+            nn.Linear(self.fused_dim, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, n_actions),
+        )
+ 
+    def forward(self, protomemory, short_term_window, long_term_payload):
+        fused, single = self.fuse(protomemory, short_term_window, long_term_payload)
+        out = self.net(fused)
+        return out.squeeze(0) if single else out
+ 
+ 
+class ValueCenter(DualBranchHead):
+    def __init__(self, d_model, n_actions, query_short_memory, query_long_memory, out_dim=32):
+        super().__init__(d_model, n_actions, query_short_memory, query_long_memory, out_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.fused_dim, d_model),
             nn.ReLU(),
             nn.Linear(d_model, 1),
         )
  
-    def forward(self, fused):
-        return self.net(fused).squeeze(-1)
-
-    def freeze_weights(self):
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def activate_weights(self):
-        for param in self.parameters():
-            param.requires_grad = True   
+    def forward(self, protomemory, short_term_window, long_term_payload):
+        fused, single = self.fuse(protomemory, short_term_window, long_term_payload)
+        out = self.net(fused).squeeze(-1)
+        return out.squeeze(0) if single else out
+ 
 
 class DreamerCenter(nn.Module):
     def __init__(self, d_model=32, n_actions=2, action_dim=16, hidden_dim=128):
@@ -600,18 +629,19 @@ class Agent(nn.Module):
         self.is_asleep = False
         
         frame_stack, img_size, _ = world.obs_shape
-        self.memory = Memory(d_model=d_model,number_of_memories=7,n_actions=world.n_actions,num_heads=num_heads)
+        self.memory = Memory(d_model=d_model, query_short_memories=5, query_long_memories=5,
+                             n_actions=world.n_actions, num_heads=num_heads)
         self.perception = Perception(frame_stack, img_size, d_model)
         self.decoder = Projection(self.perception) 
         self.dreamer = DreamerCenter(d_model, world.n_actions)
-
+ 
         self.n_actions = world.n_actions
         
-        self.cortex = Cortex(d_model, world.n_actions,self.memory.number_of_memories)
-        self.value_center = ValueCenter(d_model, world.n_actions, self.memory.number_of_memories)
+        self.cortex = Cortex(d_model, world.n_actions, self.memory.query_short_memories, self.memory.query_long_memories)
+        self.value_center = ValueCenter(d_model, world.n_actions, self.memory.query_short_memories, self.memory.query_long_memories)
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-
+ 
     def waking_up(self):
         self.cortex.freeze_weights()
         self.value_center.freeze_weights()
@@ -619,34 +649,45 @@ class Agent(nn.Module):
         self.perception.activate_weights()
         self.decoder.activate_weights()
         self.is_asleep = False
-
+ 
+    def _memory_features(self, retrieved):
+        # Turns Memory.retrieve()'s {"short": {...}, "long": {...}} dict into
+        # the two tensors Cortex/ValueCenter expect: a (seq_len, d_model+n_actions+1)
+        # short-term window for the temporal conv, and a flattened long-term payload.
+        short = retrieved["short"]
+        short_actions_onehot = F.one_hot(short["actions"], num_classes=self.n_actions).float()
+        short_window = torch.cat([short["protos"], short_actions_onehot, short["rewards"]], dim=-1)
+ 
+        long = retrieved["long"]
+        long_actions_onehot = F.one_hot(long["actions"], num_classes=self.n_actions).float()
+        long_payload = torch.cat([long["protos"], long_actions_onehot, long["rewards"]], dim=-1).view(-1)
+ 
+        return short_window, long_payload
+ 
     def awake_cycle(self, worldview):
         protomemory = self.perception(worldview)  
         retrieved = self.memory.retrieve(protomemory)
-
-        actions_onehot = F.one_hot(retrieved["actions"], num_classes=self.n_actions).float()
-        full_payload = torch.cat([retrieved["protos"], actions_onehot, retrieved["rewards"]], dim=-1)
-
-        fused = torch.cat([protomemory, full_payload.view(-1)], dim=-1)
-        action_logits = self.cortex(fused)
-        predicted_value = self.value_center(fused)
+        short_window, long_payload = self._memory_features(retrieved)
+ 
+        action_logits = self.cortex(protomemory, short_window, long_payload)
+        predicted_value = self.value_center(protomemory, short_window, long_payload)
         recreated_world_view = self.decoder(protomemory)
-
+ 
         dist = torch.distributions.Categorical(logits=action_logits)
         action = dist.sample()
-
+ 
         predicted_next_embedding,predicted_reward,predicted_losing_probability = self.dreamer(protomemory.detach(), action.detach())
-
+ 
         return (action_logits.detach(), action.detach(), predicted_value, predicted_reward,predicted_losing_probability,
                 recreated_world_view, protomemory.detach(), predicted_next_embedding)
-
+ 
     @torch.no_grad()
     def get_value(self, worldview):
         proto = self.perception(worldview)
-        mem_snap = self.memory.retrieve(proto)
-        fused = torch.cat([proto, mem_snap], dim=-1)
-        return self.value_center(fused).squeeze()
-
+        retrieved = self.memory.retrieve(proto)
+        short_window, long_payload = self._memory_features(retrieved)
+        return self.value_center(proto, short_window, long_payload).squeeze()
+ 
     def going_to_sleep(self):
         self.cortex.activate_weights()
         self.value_center.activate_weights()
@@ -654,45 +695,37 @@ class Agent(nn.Module):
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
         self.is_asleep = True
-
+ 
     def sleep(self, number_of_dreams,lambda_=0.95):
         log_probs, values, rewards, entropies, continue_prob = [], [], [], [], []
         
         dreamed_next_embedding = self.memory.random_long_term_memory().proto
-
+ 
         for i in range(number_of_dreams):
-            query = dreamed_next_embedding.unsqueeze(0).unsqueeze(0)
-            retrieved = self.memory.retrieve(query)
-
-            actions_onehot = F.one_hot(retrieved["actions"], num_classes=self.n_actions).float()
-            full_payload = torch.cat([retrieved["protos"], actions_onehot, retrieved["rewards"]], dim=-1)   
-
-            fused = torch.cat([dreamed_next_embedding, full_payload.view(-1)], dim=-1)
-            action_logits = self.cortex(fused)
-
+            retrieved = self.memory.retrieve(dreamed_next_embedding)
+            short_window, long_payload = self._memory_features(retrieved)
+ 
+            action_logits = self.cortex(dreamed_next_embedding, short_window, long_payload)
+ 
             dist = torch.distributions.Categorical(logits=action_logits)
             action = dist.sample()
-
-            predicted_value = self.value_center(fused) 
+ 
+            predicted_value = self.value_center(dreamed_next_embedding, short_window, long_payload)
             dreamed_next_embedding, predicted_reward,predicted_losing_probability = self.dreamer(dreamed_next_embedding, action)
             predicted_continue_prob = torch.sigmoid(-predicted_losing_probability)
-
+ 
             continue_prob.append(predicted_continue_prob.detach())
             log_probs.append(dist.log_prob(action))
             values.append(predicted_value.squeeze())
             rewards.append(predicted_reward.detach()) 
             entropies.append(dist.entropy())
-
+ 
         # ---- Bootstrap the final imagined state instead of just summing rewards ----
         with torch.no_grad():
-            query = dreamed_next_embedding.unsqueeze(0).unsqueeze(0)
-            retrieved = self.memory.retrieve(query)
-            actions_onehot = F.one_hot(retrieved["actions"], num_classes=self.n_actions).float()
-            full_payload = torch.cat([retrieved["protos"], actions_onehot, retrieved["rewards"]], dim=-1)   
-
-            fused = torch.cat([dreamed_next_embedding, full_payload.view(-1)], dim=-1)
-            R = self.value_center(fused).squeeze()
-
+            retrieved = self.memory.retrieve(dreamed_next_embedding)
+            short_window, long_payload = self._memory_features(retrieved)
+            R = self.value_center(dreamed_next_embedding, short_window, long_payload).squeeze()
+ 
         returns = [R]
         for t in reversed(range(len(rewards) - 1)):
             r_t = rewards[t].detach()
@@ -701,7 +734,7 @@ class Agent(nn.Module):
             
             R = r_t + self.gamma * c_t * ((1 - lambda_) * v_next + lambda_ * R)
             returns.insert(0, R)
-
+ 
         returns_t = torch.stack(returns[:-1])
         values_t = torch.stack(values[:-1])
         advantages = (returns_t - values_t).detach()
@@ -713,24 +746,24 @@ class Agent(nn.Module):
         value_loss = F.mse_loss(values_t, returns_t.detach())
     
         loss = actor_loss - self.entropy_coef * entropy_bonus + value_loss
-
+ 
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizer.step()
-
+ 
         return actor_loss.detach(),entropy_bonus.detach(),value_loss.detach()
-
+ 
     def remember(self, proto, action, reward, reward_prediction_error):
         self.memory.add(Association(proto, action, reward, reward_prediction_error))
-
+ 
     def freeze_all(self):
         self.cortex.freeze_weights()
         self.dreamer.freeze_weights()
         self.value_center.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
-
+ 
 def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=False):
     world = World("CartPole-v1", render=render)
     agent = Agent(world, d_model=32, lr=lr)
@@ -747,7 +780,7 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
         world.reset()
         done = False
         ep_reward = 0.0
-
+ 
         while not done:
             viewed_world = world.observe()
  
@@ -769,12 +802,12 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
             error_tracker.append_measurments(prediction_error=reward_loss.detach(),
                                             decoding_error=recon_loss.detach(),
                                             world_error=dynamics_loss.detach())
-
+ 
             awake_optimizer.zero_grad()
             awake_loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
             awake_optimizer.step()
-
+ 
             agent.remember(
                 proto=protomemory,
                 action=action.item(),
@@ -783,10 +816,10 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
             )
  
             ep_reward += reward
-
+ 
         error_tracker.end_episode(ep_reward)
         agent.going_to_sleep()
-
+ 
         if len(agent.memory) > 0:
             actor_loss_list = 0
             entropy_bonus_list = 0 
@@ -803,7 +836,7 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
             print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
  
     return agent, error_tracker
-
+ 
  
 def watch(agent, num_episodes=100, render=True):
     world = World("CartPole-v1", render=render)
