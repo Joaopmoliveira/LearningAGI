@@ -132,7 +132,7 @@ class ErrorTracking:
         self.dream_actor_loss.append(actor_loss)
         self.dream_entropy_loss.append(entropy_bonus)
         self.dream_value_loss.append(value_loss)
-        
+
     def render_pdf(self, eval_frames=None, filename="error_tracking_report.pdf"):
         """
         Assembles everything this class has tracked into one PDF:
@@ -325,6 +325,8 @@ class Memory(nn.Module):
             if abs(transition.priority) > abs(self.long_term[min_idx].priority):
                 self.long_term[min_idx] = transition
 
+    def add_short_term(self,transition):
+        self.short_term.append(transition)
 
     def _stack_or_empty(self, items, width=None):
         if not items:
@@ -695,19 +697,19 @@ class Agent(nn.Module):
     def sleep(self, number_of_dreams,lambda_=0.95):
         log_probs, values, rewards, entropies, continue_prob = [], [], [], [], []
         
-        dreamed_next_embedding = self.memory.random_long_term_memory().proto
+        dreamed_previous_embedding = self.memory.random_long_term_memory().proto
  
         for i in range(number_of_dreams):
-            retrieved = self.memory.retrieve(dreamed_next_embedding)
+            retrieved = self.memory.retrieve(dreamed_previous_embedding)
             short_window, long_payload = self._memory_features(retrieved)
  
-            action_logits = self.cortex(dreamed_next_embedding, short_window, long_payload)
+            action_logits = self.cortex(dreamed_previous_embedding, short_window, long_payload)
  
             dist = torch.distributions.Categorical(logits=action_logits)
             action = dist.sample()
  
-            predicted_value = self.value_center(dreamed_next_embedding, short_window, long_payload)
-            dreamed_next_embedding, predicted_reward,predicted_losing_probability = self.dreamer(dreamed_next_embedding, action)
+            predicted_value = self.value_center(dreamed_previous_embedding, short_window, long_payload)
+            dreamed_next_embedding, predicted_reward,predicted_losing_probability = self.dreamer(dreamed_previous_embedding, action)
             predicted_continue_prob = torch.sigmoid(-predicted_losing_probability)
  
             continue_prob.append(predicted_continue_prob.detach())
@@ -715,6 +717,9 @@ class Agent(nn.Module):
             values.append(predicted_value.squeeze())
             rewards.append(predicted_reward.detach()) 
             entropies.append(dist.entropy())
+
+            self.memory.add_short_term(Association(proto=dreamed_previous_embedding,action=action.item(),reward=predicted_reward,priority=0.0,))
+            dreamed_previous_embedding = dreamed_next_embedding
  
         with torch.no_grad():
             retrieved = self.memory.retrieve(dreamed_next_embedding)
@@ -747,7 +752,7 @@ class Agent(nn.Module):
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizer.step()
  
-        return actor_loss.detach(),entropy_bonus.detach(),value_loss.detach()
+        return actor_loss.detach(),(-self.entropy_coef * entropy_bonus).detach(),value_loss.detach()
  
     def remember(self, proto, action, reward, priority):
         self.memory.add(Association(proto, action, reward, priority))
@@ -819,7 +824,7 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
         while not done:
             viewed_world = world.observe()
  
-            (_, action, predicted_value , predicted_reward,predicted_losing_probability,
+            (action_logits, action, predicted_value , predicted_reward,predicted_losing_probability,
                             recreated_world_view, protomemory, predicted_next_embedding) = agent.awake_cycle(viewed_world)
 
            
