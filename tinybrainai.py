@@ -17,7 +17,7 @@ import matplotlib.colors as mcolors
 
 
 def plot_metric_trend(list_of_lists, title, ylabel, save_path,
-                       early_color="red", late_color="blue",
+                       colors=("#d62728", "#ff7f0e", "#bcbd22", "#2ca02c", "#1f77b4", "#9467bd"),
                        xlabel="Step within episode", legend_label="Episode"):
     """
     Generic version of the reward-error plot: takes ANY list of
@@ -31,7 +31,8 @@ def plot_metric_trend(list_of_lists, title, ylabel, save_path,
     if n_epochs == 0:
         return None
  
-    cmap = mcolors.LinearSegmentedColormap.from_list("epoch_gradient", [early_color, late_color])
+    #cmap = mcolors.LinearSegmentedColormap.from_list("epoch_gradient", [early_color, late_color])
+    cmap = mcolors.LinearSegmentedColormap.from_list("epoch_gradient", list(colors))
  
     plt.figure(figsize=(7, 4))
     for i, series in enumerate(list_of_lists):
@@ -104,44 +105,42 @@ def plot_simple_series_curve(series, label, title, save_path="temp_reward_plot.p
 class ErrorTracking:
     def __init__(self):
         self.rewards = []
-        self.episode_prediction_errors = []
-        self.episode_decoding_errors = []
-        self.episode_world_evolution_errors = []
-
-        self.intra_episode_prediction_errors = []
-        self.intra_episode_decoding_errors = []
-        self.intra_episode_world_evolution_errors = []
-
         self.dream_actor_loss = []
         self.dream_entropy_loss = []
         self.dream_value_loss = []
 
-    def start_episode(self):
-        self.intra_episode_prediction_errors = []
-        self.intra_episode_decoding_errors = []
-        self.intra_episode_world_evolution_errors = []
+        self.episodict_time_series = {}
 
-    def append_measurments(self,prediction_error,decoding_error,world_error):
-        self.intra_episode_prediction_errors.append(prediction_error)
-        self.intra_episode_decoding_errors.append(decoding_error)
-        self.intra_episode_world_evolution_errors.append(world_error)
+    def register_variable_query(self,name,callback,reportdata):
+        self.episodict_time_series[name] = {"callback":callback,"pdfdata": reportdata,"list_of_timeseries":[],"intra_timeseries":[]}
+
+    def start_episode(self):
+        for key in self.episodict_time_series:
+            self.episodict_time_series[key]["intra_timeseries"] = []
+
+    def query_measurments(self):
+        for key in self.episodict_time_series:
+            value = self.episodict_time_series[key]["callback"]()
+            self.episodict_time_series[key]["intra_timeseries"].append(value)
+
+    def end_episode(self,real_reward):
+        self.rewards.append(real_reward)
+        for key in self.episodict_time_series:
+            self.episodict_time_series[key]["list_of_timeseries"].append(self.episodict_time_series[key]["intra_timeseries"])
 
     def append_sleep(self,actor_loss,entropy_bonus,value_loss):
         self.dream_actor_loss.append(actor_loss)
         self.dream_entropy_loss.append(entropy_bonus)
         self.dream_value_loss.append(value_loss)
         
-    def end_episode(self,real_reward):
-        self.episode_prediction_errors.append(self.intra_episode_prediction_errors)
-        self.episode_decoding_errors.append(self.intra_episode_decoding_errors)
-        self.episode_world_evolution_errors.append(self.intra_episode_world_evolution_errors)
-        self.rewards.append(real_reward)
-
     def render_pdf(self, eval_frames=None, filename="error_tracking_report.pdf"):
         """
         Assembles everything this class has tracked into one PDF:
-        the reward curve, plus a red(early)->blue(late) trend plot for
-        each of the three intra-episode error series, plus (optionally)
+        the reward curve, the sleep-phase losses, plus a red(early)->
+        purple(late) trend plot for every metric registered via
+        register_variable_query (each using its own section/title/
+        description, so adding a new tracked metric needs no changes
+        here -- just a register_variable_query call), and (optionally)
         a grid of evaluation frames if you pass some in.
         """
         sections = []  # (heading, image_path, caption) in render order
@@ -149,33 +148,28 @@ class ErrorTracking:
         if self.rewards:
             reward_plot = plot_reward_curve(self.rewards, save_path="temp_rewards.png")
             sections.append(("Learning Performance", reward_plot, None))
-
+ 
         path = plot_simple_series_curve(self.dream_actor_loss, "actor loss", "actor loss", save_path="temp_actorloss_plot.png")
         sections.append(("Actor loss", path, None))
-
+ 
         path = plot_simple_series_curve(self.dream_value_loss, "Value loss", "Value loss", save_path="temp_valueloss_plot.png")
         sections.append(("Value loss", path, None))
-
+ 
         path = plot_simple_series_curve(self.dream_entropy_loss, "Entropy loss", "Entropy loss", save_path="temp_entropyloss_plot.png")
         sections.append(("Entropy loss", path, None))
  
-        error_series = [
-            ("Next Step Reward", self.episode_prediction_errors,
-             "Reward/next-state prediction error", "temp_prediction_error.png"),
-            ("Perception", self.episode_decoding_errors,
-             "Encoder-Decoder", "temp_decoding_error.png"),
-            ("Dreamer", self.episode_world_evolution_errors,
-             "World-evolution (dynamics) error", "temp_world_error.png")
-        ]
-
-        caption = ("Each line is one episode's error over its steps. Color moves from "
-                   "red (earliest episodes) to blue (latest episodes) to reveal whether "
-                   "error is shrinking across training.")
-        for heading, series, ylabel, path in error_series:
+        for name, data in self.episodict_time_series.items():
+            series = data["list_of_timeseries"]
             if not series:
                 continue
+            reportdata = data["pdfdata"]
+            heading = reportdata.get("section", name)
+            title = reportdata.get("title", heading)
+            ylabel = reportdata.get("ylabel", title)
+            caption = reportdata.get("description")
+ 
             plot_path = plot_metric_trend(
-                series, title=heading, ylabel=ylabel, save_path=path,
+                series, title=title, ylabel=ylabel, save_path=f"temp_{name}.png",
             )
             sections.append((heading, plot_path, caption))
  
@@ -240,6 +234,7 @@ class ErrorTracking:
             if os.path.exists(fpath):
                 os.remove(fpath)
 
+
 ## The world is an abstraction over what our agents can see:
 # the way I see this is that we can observe the world, get rewards, etc
 # doubts: 
@@ -299,11 +294,11 @@ class World:
 # but for now I need to store a signal to indicate to the attention mechanism 
 # what is good and what is bad
 class Association:
-    def __init__(self, proto, action, reward, reward_prediction_error):
+    def __init__(self, proto, action, reward, priority):
         self.proto = proto
         self.action = action
         self.reward = reward
-        self.reward_prediction_error = reward_prediction_error
+        self.priority = priority
 
 
 # The memory is just a list of Associations and an attention layer to select the best memories, 
@@ -326,9 +321,10 @@ class Memory(nn.Module):
         if len(self.long_term) < self.long_capacity:
             self.long_term.append(transition)
         else:
-            min_idx = min(range(len(self.long_term)), key=lambda i: abs(self.long_term[i].reward_prediction_error))
-            if abs(transition.reward_prediction_error) > abs(self.long_term[min_idx].reward_prediction_error):
+            min_idx = min(range(len(self.long_term)), key=lambda i: abs(self.long_term[i].priority))
+            if abs(transition.priority) > abs(self.long_term[min_idx].priority):
                 self.long_term[min_idx] = transition
+
 
     def _stack_or_empty(self, items, width=None):
         if not items:
@@ -676,7 +672,7 @@ class Agent(nn.Module):
         dist = torch.distributions.Categorical(logits=action_logits)
         action = dist.sample()
  
-        predicted_next_embedding,predicted_reward,predicted_losing_probability = self.dreamer(protomemory.detach(), action.detach())
+        predicted_next_embedding,predicted_reward,predicted_losing_probability = self.dreamer(protomemory, action)
  
         return (action_logits.detach(), action.detach(), predicted_value, predicted_reward,predicted_losing_probability,
                 recreated_world_view, protomemory.detach(), predicted_next_embedding)
@@ -720,7 +716,6 @@ class Agent(nn.Module):
             rewards.append(predicted_reward.detach()) 
             entropies.append(dist.entropy())
  
-        # ---- Bootstrap the final imagined state instead of just summing rewards ----
         with torch.no_grad():
             retrieved = self.memory.retrieve(dreamed_next_embedding)
             short_window, long_payload = self._memory_features(retrieved)
@@ -754,8 +749,8 @@ class Agent(nn.Module):
  
         return actor_loss.detach(),entropy_bonus.detach(),value_loss.detach()
  
-    def remember(self, proto, action, reward, reward_prediction_error):
-        self.memory.add(Association(proto, action, reward, reward_prediction_error))
+    def remember(self, proto, action, reward, priority):
+        self.memory.add(Association(proto, action, reward, priority))
  
     def freeze_all(self):
         self.cortex.freeze_weights()
@@ -768,7 +763,47 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
     world = World("CartPole-v1", render=render)
     agent = Agent(world, d_model=32, lr=lr)
     error_tracker = ErrorTracking()
- 
+
+    temp_episodic_metric_storage = {"reward_error" : 0.0,
+                                    "encoder_decoder_error" : 0.0,
+                                    "predict_next_word_state": 0.0,
+                                    "done_loss" : 0.0
+                                    }
+
+
+    error_tracker.register_variable_query(name = "reward_error",
+                                          callback= lambda: temp_episodic_metric_storage["reward_error"],
+                                          reportdata={
+                                              "section":"Reward Prediction Error",
+                                              "title":"Reward Prediction Error",
+                                              "description":"The plot shows the error in prediction the reward as time progresses for each episode. The color coding represents the passage of episodes"
+                                              }
+                                          )
+    error_tracker.register_variable_query(name = "encoder_decoder_error",
+                                          callback= lambda: temp_episodic_metric_storage["encoder_decoder_error"],
+                                          reportdata={
+                                              "section":"Encoder-Decoder Error",
+                                              "title":"Decorder Error",
+                                              "description":"The plot shows the error in transforming the latent space into the real world observation. The color coding represents the passage of episodes"
+                                              }
+                                          )
+    error_tracker.register_variable_query(name = "predict_next_word_state",
+                                          callback= lambda: temp_episodic_metric_storage["predict_next_word_state"],
+                                          reportdata={
+                                              "section":"Predicting World State from Action-Previous State",
+                                              "title":"World State Error (Action-Previous State)",
+                                              "description":"The plot shows the error in predicting the next latent spate (condensed world representation) given the action and the previous world representation. The color coding represents the passage of episodes"
+                                              }
+                                          )
+    error_tracker.register_variable_query(name = "done_loss",
+                                          callback= lambda: temp_episodic_metric_storage["done_loss"],
+                                          reportdata={
+                                              "section":"Predicting Termination of Game",
+                                              "title":"Done Losss",
+                                              "description":"The plot shows the error of the model in predicting termination. The color coding represents the passage of episodes"
+                                              }
+                                          )
+
     for episode in range(num_episodes):
         agent.waking_up()
         error_tracker.start_episode()
@@ -784,14 +819,17 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
         while not done:
             viewed_world = world.observe()
  
-            (_, action, _, predicted_reward,predicted_losing_probability,
+            (_, action, predicted_value , predicted_reward,predicted_losing_probability,
                             recreated_world_view, protomemory, predicted_next_embedding) = agent.awake_cycle(viewed_world)
- 
+
+           
             _, reward, done, _ = world.act(action.item())
             next_obs = world.observe()
             with torch.no_grad():
                 next_proto_target = agent.perception(next_obs)
- 
+                next_value = 0.0 if done else agent.get_value(next_obs).item()
+                td_error = reward + agent.gamma * next_value - predicted_value.item()
+
             recon_loss = F.mse_loss(recreated_world_view, viewed_world)
             reward_loss = F.mse_loss(predicted_reward, torch.tensor(reward, dtype=torch.float32))
             dynamics_loss = F.mse_loss(predicted_next_embedding, next_proto_target)
@@ -799,9 +837,12 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
                 predicted_losing_probability, torch.tensor(float(done), dtype=torch.float32)
             )
             awake_loss = recon_loss + reward_loss + dynamics_loss + done_loss
-            error_tracker.append_measurments(prediction_error=reward_loss.detach(),
-                                            decoding_error=recon_loss.detach(),
-                                            world_error=dynamics_loss.detach())
+
+            temp_episodic_metric_storage["reward_error"] = reward_loss.detach()
+            temp_episodic_metric_storage["encoder_decoder_error"] = recon_loss.detach()
+            temp_episodic_metric_storage["predict_next_word_state"] = dynamics_loss.detach()
+            temp_episodic_metric_storage["done_loss"] = done_loss.detach()
+            error_tracker.query_measurments()
  
             awake_optimizer.zero_grad()
             awake_loss.backward()
@@ -812,11 +853,11 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
                 proto=protomemory,
                 action=action.item(),
                 reward=reward,
-                reward_prediction_error=abs(reward - predicted_reward.item())
+                priority = abs(td_error)
             )
  
             ep_reward += reward
- 
+        #print("!")
         error_tracker.end_episode(ep_reward)
         agent.going_to_sleep()
  
@@ -838,7 +879,7 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
     return agent, error_tracker
  
  
-def watch(agent, num_episodes=100, render=True):
+def watch(agent, num_episodes=1, render=True):
     world = World("CartPole-v1", render=render)
     captured_frames = []
     for episode in range(num_episodes):
@@ -848,14 +889,18 @@ def watch(agent, num_episodes=100, render=True):
         while not done:
             obs_t = world.observe()
             with torch.no_grad():
-                (action_logits, action, _, predicted_reward,predicted_losing_probability,
+                (action_logits, action, predicted_value, predicted_reward,predicted_losing_probability,
                                             recreated_world_view, protomemory, predicted_next_embedding) = agent.awake_cycle(obs_t)
                  
             action = torch.argmax(action_logits)
-            next_obs, reward, done, _ = world.act(action.item())
+            _, reward, done, _ = world.act(action.item())
+            next_obs = world.observe()
+            with torch.no_grad():
+                next_proto_target = agent.perception(next_obs)
+                next_value = 0.0 if done else agent.get_value(next_obs).item()
+                td_error = reward + agent.gamma * next_value - predicted_value.item()
             captured_frames.append(world.env.render())
-            reward_prediction_error = reward - predicted_reward.item()
-            agent.remember(proto=protomemory, action=action.item(), reward=reward, reward_prediction_error=reward_prediction_error)
+            agent.remember(proto=protomemory, action=action.item(), reward=reward, priority=abs(td_error))
  
             ep_reward += reward
         print(f"[watch] Episode {episode + 1}: reward = {ep_reward:.0f}")
@@ -870,7 +915,7 @@ if __name__ == "__main__":
     trained_brain, error_tracker = train(num_episodes=1000, render=False)
     trained_brain.freeze_all()
     # we then just force the brain to move in the world
-    captured_frames = watch(trained_brain, num_episodes=3, render=True)
+    captured_frames = watch(trained_brain, num_episodes=1, render=True)
     ## Because we are cool we generate a pdf file with 
     # a report detailing the statistics during training
     error_tracker.render_pdf(captured_frames)    
