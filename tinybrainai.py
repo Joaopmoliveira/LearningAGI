@@ -108,6 +108,8 @@ class ErrorTracking:
         self.dream_actor_loss = []
         self.dream_entropy_loss = []
         self.dream_value_loss = []
+        self.dream_continue_prob_var = []
+        self.dream_continue_prob_mean = []
 
         self.episodict_time_series = {}
 
@@ -128,10 +130,12 @@ class ErrorTracking:
         for key in self.episodict_time_series:
             self.episodict_time_series[key]["list_of_timeseries"].append(self.episodict_time_series[key]["intra_timeseries"])
 
-    def append_sleep(self,actor_loss,entropy_bonus,value_loss):
+    def append_sleep(self,actor_loss,entropy_bonus,value_loss,continue_prob_var, continue_prob_mean):
         self.dream_actor_loss.append(actor_loss)
         self.dream_entropy_loss.append(entropy_bonus)
         self.dream_value_loss.append(value_loss)
+        self.dream_continue_prob_var.append(continue_prob_var)
+        self.dream_continue_prob_mean.append(continue_prob_mean)
 
     def render_pdf(self, eval_frames=None, filename="error_tracking_report.pdf"):
         """
@@ -157,7 +161,15 @@ class ErrorTracking:
  
         path = plot_simple_series_curve(self.dream_entropy_loss, "Entropy loss", "Entropy loss", save_path="temp_entropyloss_plot.png")
         sections.append(("Entropy loss", path, None))
- 
+
+        path = plot_simple_series_curve(self.dream_continue_prob_var, "continue_prob variance",
+                                        "Continue-Prob Variance (dream)", save_path="temp_cpvar_plot.png")
+        sections.append(("Continue-Prob Variance", path, None))
+
+        path = plot_simple_series_curve(self.dream_continue_prob_mean, "continue_prob mean",
+                                        "Continue-Prob Mean (dream)", save_path="temp_cpmean_plot.png")
+        sections.append(("Continue-Prob Mean", path, None))
+
         for name, data in self.episodict_time_series.items():
             series = data["list_of_timeseries"]
             if not series:
@@ -300,20 +312,33 @@ class Association:
         self.reward = float(reward)
         self.priority = priority
 
+    def compact(self):
+        reward_t = torch.tensor([self.reward], dtype=self.proto.dtype)
+        return torch.cat([self.proto, self.action_embedding, reward_t], dim=-1)
 
 # The memory is just a list of Associations and an attention layer to select the best memories, 
 # with some hardcoded heuristics for the moment.
 # When should it be trained? 
 # Unclear. My instinct is to train it at night only
-
 class Memory(nn.Module):
-    def __init__(self, d_model,d_action, query_short_memories = 5, query_long_memories = 5,num_heads=2, short_capacity=8, long_capacity=64):
+    def __init__(self, d_model, d_action, query_short_memories=5, query_long_memories=5,
+                 num_heads=2, short_capacity=8, long_capacity=64):
         super().__init__()
         self.short_term = collections.deque(maxlen=short_capacity)
         self.long_term = []
         self.long_capacity = long_capacity
-        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
-        self.v_proj = nn.Linear(d_model + d_action + 1, d_model)
+
+        step_dim = d_model + d_action + 1
+        self.attn_dim = d_model
+        assert self.attn_dim % num_heads == 0, (
+            f"attn_dim ({self.attn_dim}) must be divisible by num_heads ({num_heads})"
+        )
+
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.attn_dim, num_heads=num_heads, kdim=d_model, vdim=step_dim, batch_first=True
+        )
+        self.q_proj = nn.Linear(d_model, self.attn_dim)
+
         self.query_short_memories = query_short_memories
         self.query_long_memories = query_long_memories
         self.d_model = d_model
@@ -331,69 +356,28 @@ class Memory(nn.Module):
     def add_short_term(self,transition):
         self.short_term.append(transition)
 
-    #def _stack_or_empty(self, items, width=None):
-    #    if not items:
-    #        return torch.zeros(0, width) if width is not None else torch.zeros(0, dtype=torch.long)
-    #    return torch.stack(items) if torch.is_tensor(items[0]) else torch.tensor(items)
-    def _stack_or_empty(self, items, width):
-        if not items:
-            return torch.zeros(0, width)
-        if torch.is_tensor(items[0]):
-            return torch.stack(items)
-        return torch.tensor(items, dtype=torch.float32).unsqueeze(-1)
-    def retrieve(self, query_proto):
-        memories = {"short": {}, "long": {}}
-
+    def compact_short_memories(self):
         short_items = list(self.short_term)[-self.query_short_memories:]
         pad_size = max(0, self.query_short_memories - len(short_items))
+        width = self.d_model + self.d_action + 1
+        pieces = [torch.zeros(width) for _ in range(pad_size)] + [t.compact() for t in short_items]
+        return torch.stack(pieces, dim=0)   # (query_short_memories, step_dim) — not flattened
 
-        short_protos = self._stack_or_empty([t.proto for t in short_items], width=self.d_model)
-        short_action_embeds = self._stack_or_empty([t.action_embedding for t in short_items], width=self.d_action)
-        short_rewards = self._stack_or_empty([t.reward for t in short_items], width=1)
-        if short_rewards.dim() == 1 and short_rewards.numel() > 0:
-            short_rewards = short_rewards.unsqueeze(-1)
+    def compact_long_memories(self, query):
+        if len(self.long_term) == 0:
+            return torch.zeros(self.attn_dim), torch.zeros(0)
+        k_protos = torch.stack([t.proto for t in self.long_term])   # (N, d_model)
+        v_raw = torch.stack([t.compact() for t in self.long_term])  # (N, step_dim)
 
-        memories["short"]["protos"] = torch.cat([torch.zeros(pad_size, self.d_model), short_protos], dim=0)
-        memories["short"]["actions"] = torch.cat([torch.zeros(pad_size, self.d_action), short_action_embeds], dim=0)
-        memories["short"]["rewards"] = torch.cat([torch.zeros(pad_size, 1), short_rewards], dim=0)
+        q_embed = self.q_proj(query).view(1, 1, -1)   # (1, 1, attn_dim)
+        key = k_protos.unsqueeze(0)                    # (1, N, d_model)
+        values = v_raw.unsqueeze(0)                    # (1, N, step_dim)
 
-        if len(self.long_term) <= self.query_long_memories:
-            pad_size = self.query_long_memories - len(self.long_term)
-            long_protos = self._stack_or_empty([t.proto for t in self.long_term], width=self.d_model)
-            long_action_embeds = self._stack_or_empty([t.action_embedding for t in self.long_term], width=self.d_action)
-            long_rewards = self._stack_or_empty([t.reward for t in self.long_term], width=1)
-            if long_rewards.dim() == 1 and long_rewards.numel() > 0:
-                long_rewards = long_rewards.unsqueeze(-1)
+        output, attn_weights = self.attention(q_embed, key, values)
+        return output.view(-1), attn_weights.view(-1)  # (attn_dim,), (N,)
 
-            memories["long"]["protos"] = torch.cat([long_protos, torch.zeros(pad_size, self.d_model)], dim=0)
-            memories["long"]["actions"] = torch.cat([long_action_embeds, torch.zeros(pad_size, self.d_action)], dim=0)
-            memories["long"]["rewards"] = torch.cat([long_rewards, torch.zeros(pad_size, 1)], dim=0)
-            return memories
-
-        k_protos = torch.stack([t.proto for t in self.long_term])
-        k_action_embeds = torch.stack([t.action_embedding for t in self.long_term])
-        rewards = torch.tensor([t.reward for t in self.long_term]).float().unsqueeze(-1)
-
-        v_raw = torch.cat([k_protos, k_action_embeds, rewards], dim=-1)
-        v_embeds = self.v_proj(v_raw)
-
-        query = query_proto.view(1, 1, self.d_model)
-        key = k_protos.unsqueeze(0)
-        values = v_embeds.unsqueeze(0)
-
-        _, attn_weights = self.attention(query, key, values)
-        attn_weights = attn_weights.squeeze(0).squeeze(0)
-
-        actual_k = min(self.query_long_memories, len(self.long_term))
-        _, top_indices = torch.topk(attn_weights, k=actual_k)
-
-        memories["long"] = {
-            "protos": k_protos[top_indices],
-            "actions": k_action_embeds[top_indices],
-            "rewards": rewards[top_indices],
-        }
-        return memories
-
+    def raw_long_memories(self):
+        return self.long_term
 
     def random_long_term_memory(self) :
         return random.sample(self.long_term, 1)[0]
@@ -430,13 +414,14 @@ class Perception(nn.Module):
         self.conv_out_shape = conv_out.shape[1:]  # (C, H, W) after the conv stack
         conv_out_dim = conv_out.flatten(1).shape[1]
         self.fc = nn.Linear(conv_out_dim, d_model)
+        self.norm = nn.LayerNorm(d_model)
  
     def forward(self, obs):
         single = obs.dim() == 3
         if single:
             obs = obs.unsqueeze(0)  # add batch dim
         x = self.conv(obs).flatten(1)
-        latent = self.fc(x)
+        latent = self.norm(self.fc(x))
         return latent.squeeze(0) if single else latent
 
     def freeze_weights(self):
@@ -496,11 +481,11 @@ class Projection(nn.Module):
 # optimize different objectives and sharing a trunk is a known source of
 # actor/critic optimization interference.
 class DualBranchHead(nn.Module):
-    def __init__(self, d_model, d_action, query_short_memory, query_long_memory, out_dim=32):
+    def __init__(self, d_model, d_action, query_short_memory, long_term_dim, out_dim=32):
         super().__init__()
-        step_dim = d_model + d_action + 1  # proto + one-hot action + reward, per step/memory
+        step_dim = d_model + d_action + 1
         assert query_short_memory >= 3, "temporal_conv needs at least 3 short-term steps (two kernel-2 convs)"
- 
+
         self.temporal_conv = nn.Sequential(
             nn.Conv1d(in_channels=step_dim, out_channels=64, kernel_size=2, stride=1),
             nn.ReLU(),
@@ -510,8 +495,7 @@ class DualBranchHead(nn.Module):
             nn.Linear(32 * (query_short_memory - 2), out_dim),
             nn.ReLU(),
         )
- 
-        long_term_dim = query_long_memory * step_dim
+
         self.fused_dim = d_model + out_dim + long_term_dim
  
     def fuse(self, protomemory, short_term_window, long_term_payload):
@@ -536,11 +520,7 @@ class DualBranchHead(nn.Module):
             param.requires_grad = True
 
 class ActionMapper(nn.Module):
-    """
-    Translates continuous proto-actions into discrete environment actions 
-    by matching them against a learned codebook of action embeddings.
-    """
-    def __init__(self, n_actions: int, d_action: int, temperature: float = 1.0):
+    def __init__(self, n_actions: int, d_action: int, temperature: float = 0.1):
         super().__init__()
         self.n_actions = n_actions
         self.d_action = d_action
@@ -551,37 +531,28 @@ class ActionMapper(nn.Module):
         nn.init.normal_(self.codebook.weight, std=0.02)
 
     def compute_scores(self, proto_action: torch.Tensor) -> torch.Tensor:
-        """
-        Computes scaled dot-product similarity between proto-action(s) and codebook embeddings.
-        Input shape:  (..., d_action)
-        Output shape: (..., n_actions)
-        """
         # Normalize vectors for cosine similarity stability if desired
         proto_norm = F.normalize(proto_action, p=2, dim=-1)
         codebook_norm = F.normalize(self.codebook.weight, p=2, dim=-1)
         
         # Similarity score: (..., d_action) x (d_action, n_actions) -> (..., n_actions)
-        scores = (proto_norm @ codebook_norm.t()) / (self.temperature * (self.d_action ** 0.5))
+        scores = (proto_norm @ codebook_norm.t()) / self.temperature
         return scores
 
     def distribution(self, proto_action: torch.Tensor) -> torch.distributions.Categorical:
-        """Returns a Categorical distribution over discrete actions based on similarity scores."""
         scores = self.compute_scores(proto_action)
         return torch.distributions.Categorical(logits=scores)
 
     def sample(self, proto_action: torch.Tensor):
-        """Samples a discrete action from the proto-action similarity distribution."""
         dist = self.distribution(proto_action)
         action_idx = dist.sample()
         return action_idx, dist
 
     def best(self, proto_action: torch.Tensor) -> torch.Tensor:
-        """Greedy matching: returns the discrete action index with highest codebook similarity."""
         scores = self.compute_scores(proto_action)
         return torch.argmax(scores, dim=-1)
 
     def encode(self, action_idx: torch.Tensor) -> torch.Tensor:
-        """Looks up the continuous embedding vector for given action index/indices."""
         return self.codebook(action_idx)
 
     def freeze_weights(self):
@@ -593,22 +564,25 @@ class ActionMapper(nn.Module):
             param.requires_grad = True
 
 class Cortex(DualBranchHead):
-    def __init__(self, d_model, d_action, query_short_memory, query_long_memory, out_dim=32):
-        super().__init__(d_model, d_action, query_short_memory, query_long_memory, out_dim)
+    def __init__(self, d_model, d_action, query_short_memory,
+                 long_term_dim, out_dim=32):
+        super().__init__(d_model, d_action, query_short_memory, long_term_dim, out_dim)
         self.net = nn.Sequential(
             nn.Linear(self.fused_dim, d_model),
-            nn.ReLU(),
+            nn.ELU(),
             nn.Linear(d_model, d_action),
         )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, protomemory, short_term_window, long_term_payload):
         fused, single = self.fuse(protomemory, short_term_window, long_term_payload)
-        out = self.net(fused)
-        return out.squeeze(0) if single else out
+        logits = self.net(fused)
+        return logits.squeeze(0) if single else logits
  
 class ValueCenter(DualBranchHead):
-    def __init__(self, d_model, d_action, query_short_memory, query_long_memory, out_dim=32):
-        super().__init__(d_model, d_action, query_short_memory, query_long_memory, out_dim)
+    def __init__(self, d_model, d_action, query_short_memory, long_term_dim, out_dim=32):
+        super().__init__(d_model, d_action, query_short_memory, long_term_dim, out_dim)
         self.net = nn.Sequential(
             nn.Linear(self.fused_dim, d_model),
             nn.ReLU(),
@@ -621,8 +595,8 @@ class ValueCenter(DualBranchHead):
         return out.squeeze(0) if single else out
 
 class DreamerCenter(DualBranchHead):
-    def __init__(self, d_model: int, d_action: int, query_short_memories: int, query_long_memories: int, out_dim: int = 32, hidden_dim: int = 132):
-        super().__init__(d_model, d_action, query_short_memories, query_long_memories, out_dim)
+    def __init__(self, d_model: int, d_action: int, query_short_memories: int, long_term_dim: int = 32, hidden_dim: int = 132):
+        super().__init__(d_model, d_action, query_short_memories, long_term_dim)
 
         # Fused memory/perception context + continuous action embedding vector (d_action)
         input_dim = self.fused_dim + d_action
@@ -637,7 +611,10 @@ class DreamerCenter(DualBranchHead):
         )
 
         # Predicts next latent state given action embedding and context
-        self.next_state_head = nn.Linear(hidden_dim, d_model)
+        self.next_state_head = nn.Sequential(
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
         # Predicts expected reward
         self.reward_head = nn.Linear(hidden_dim, 1)
         # Predicts termination probability (logits)
@@ -662,7 +639,7 @@ class DreamerCenter(DualBranchHead):
         )
 
 class Agent(nn.Module):
-    def __init__(self, world, d_model=32, d_action = 16, num_heads=2, lr=1e-3, gamma=0.99, entropy_coef=0.05):
+    def __init__(self, world, d_model=128, d_action = 16, num_heads=2, lr=1e-3, gamma=0.99, entropy_coef=0.05):
         super().__init__()
         self.d_model = d_model
         self.gamma = gamma
@@ -674,144 +651,132 @@ class Agent(nn.Module):
                              d_action=d_action, num_heads=num_heads)
         self.perception = Perception(frame_stack, img_size, d_model)
         self.decoder = Projection(self.perception) 
-        self.dreamer = DreamerCenter(d_model=d_model,d_action=d_action,query_short_memories = self.memory.query_short_memories, query_long_memories = self.memory.query_long_memories)
  
         self.n_actions = world.n_actions
         
-        self.cortex = Cortex(d_model,d_action, self.memory.query_short_memories, self.memory.query_long_memories)
+        self.cortex = Cortex(d_model, d_action, self.memory.query_short_memories, self.memory.attn_dim)
+        self.dreamer = DreamerCenter(d_model=d_model, d_action=d_action,
+                                    query_short_memories=self.memory.query_short_memories,
+                                    long_term_dim=self.memory.attn_dim)
+        self.value_center = ValueCenter(d_model, d_action, self.memory.query_short_memories, self.memory.attn_dim)
         self.action_mapper = ActionMapper(n_actions=world.n_actions, d_action=d_action)
-        self.value_center = ValueCenter(d_model, d_action, self.memory.query_short_memories, self.memory.query_long_memories)
-        
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+
  
     def waking_up(self):
+        self.memory.short_term.clear()
         self.cortex.freeze_weights()
         self.value_center.freeze_weights()
         self.dreamer.activate_weights()
+        self.action_mapper.activate_weights()
         self.perception.activate_weights()
         self.decoder.activate_weights()
+        self.memory.activate_weights()
         self.is_asleep = False
 
-    def _memory_features(self, retrieved):
-        # Turns Memory.retrieve()'s {"short": {...}, "long": {...}} dict into
-        # the two tensors Cortex/ValueCenter expect using continuous d_action vectors:
-        # short_window: (seq_len, d_model + d_action + 1)
-        # long_payload: flattened (query_long_memories * (d_model + d_action + 1))
-        short = retrieved["short"]
-        short_window = torch.cat([short["protos"], short["actions"], short["rewards"]], dim=-1)
-
-        long = retrieved["long"]
-        long_payload = torch.cat([long["protos"], long["actions"], long["rewards"]], dim=-1).view(-1)
-
-        return short_window, long_payload
- 
-    def awake_cycle(self, worldview):
-        protomemory = self.perception(worldview)  
-        retrieved = self.memory.retrieve(protomemory)
-        short_window, long_payload = self._memory_features(retrieved)
- 
-        predicted_value = self.value_center(protomemory, short_window, long_payload)
-        recreated_world_view = self.decoder(protomemory)
-        proto_action = self.cortex(protomemory, short_window, long_payload)
-        action_idx, dist = self.action_mapper.sample(proto_action)
-        action_embedding = self.action_mapper.encode(action_idx)
-
-        predicted_next_embedding, predicted_reward, predicted_losing_probability = self.dreamer(
-                    protomemory, short_window, long_payload, action_embedding
-                )
- 
-        return (
-            dist.logits.detach(),
-            action_idx.detach(),
-            predicted_value,
-            predicted_reward,
-            predicted_losing_probability,
-            recreated_world_view,
-            protomemory.detach(),
-            predicted_next_embedding,
-            proto_action
-        )
- 
     @torch.no_grad()
     def get_value(self, worldview):
         proto = self.perception(worldview)
-        retrieved = self.memory.retrieve(proto)
-        short_window, long_payload = self._memory_features(retrieved)
+        short_window = self.memory.compact_short_memories()
+        long_payload, _ = self.memory.compact_long_memories(proto)
         return self.value_center(proto, short_window, long_payload).squeeze()
  
     def going_to_sleep(self):
+        self.memory.short_term.clear()
         self.cortex.activate_weights()
         self.value_center.activate_weights()
         self.dreamer.freeze_weights()
+        self.action_mapper.freeze_weights()
+        self.memory.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
         self.is_asleep = True
- 
-    def sleep(self, number_of_dreams,lambda_=0.95):
-        log_probs, values, rewards, entropies, continue_prob = [], [], [], [], []
-        
-        dreamed_previous_embedding = self.memory.random_long_term_memory().proto
- 
+
+
+    def sleep(self, number_of_dreams, lambda_=0.95):
+        values, rewards, entropies, continue_prob,logps = [], [], [], [], []
+        saved_short_term = collections.deque(self.memory.short_term, maxlen=self.memory.short_term.maxlen)
+
+        dreamed_previous_embedding = self.memory.random_long_term_memory().proto  # leaf, fine to start detached
+
         for i in range(number_of_dreams):
-            retrieved = self.memory.retrieve(dreamed_previous_embedding)
-            short_window, long_payload = self._memory_features(retrieved)
- 
+            short_window = self.memory.compact_short_memories()
+            long_payload, _ = self.memory.compact_long_memories(dreamed_previous_embedding)
+
             proto_action = self.cortex(dreamed_previous_embedding, short_window, long_payload)
-            action_idx, dist = self.action_mapper.sample(proto_action)
-            action_embedding = self.action_mapper.encode(action_idx)
- 
+            action_idx, dist = self.action_mapper.sample(proto_action)  # keep for logging/entropy only
+            probs = dist.probs
+            onehot = F.one_hot(action_idx, self.n_actions).float()
+            st = onehot + probs - probs.detach()          # forward = onehot, backward = d/dprobs
+            action_embedding = st @ self.action_mapper.codebook.weight
+
             predicted_value = self.value_center(dreamed_previous_embedding, short_window, long_payload)
             dreamed_next_embedding, predicted_reward, predicted_losing_probability = self.dreamer(
                 dreamed_previous_embedding, short_window, long_payload, action_embedding
             )
             predicted_continue_prob = torch.sigmoid(-predicted_losing_probability)
- 
-            continue_prob.append(predicted_continue_prob.detach())
-            log_probs.append(dist.log_prob(action_idx))
+
+            logps.append(dist.log_prob(action_idx))
+            continue_prob.append(predicted_continue_prob)   # DON'T detach — need gradient for analytic path
             values.append(predicted_value.squeeze())
-            rewards.append(predicted_reward) 
+            rewards.append(predicted_reward)
             entropies.append(dist.entropy())
 
+            # still add a DETACHED copy to memory — you don't want this graph living in the deque
             self.memory.add_short_term(Association(
-                            proto=dreamed_previous_embedding.detach(),
-                            action_embedding=proto_action.detach(),
-                            reward=predicted_reward.detach(),
-                            priority=0.0,
-                        ))
-            dreamed_previous_embedding = dreamed_next_embedding.detach()
- 
-        with torch.no_grad():
-            retrieved = self.memory.retrieve(dreamed_next_embedding)
-            short_window, long_payload = self._memory_features(retrieved)
-            R = self.value_center(dreamed_next_embedding, short_window, long_payload).squeeze()
- 
-        returns = [R]
-        for t in reversed(range(len(rewards) - 1)):
+                proto=dreamed_previous_embedding.detach(),
+                action_embedding=action_embedding.detach(),
+                reward=predicted_reward.detach(),
+                priority=0.0,
+            ))
+
+            dreamed_previous_embedding = dreamed_next_embedding   # NO .detach() — keep the chain alive
+
+        # bootstrap final value, still connected to the graph
+        short_window = self.memory.compact_short_memories()
+        long_payload, _ = self.memory.compact_long_memories(dreamed_next_embedding)
+        R = self.value_center(dreamed_next_embedding, short_window, long_payload).squeeze()
+
+        self.memory.short_term = saved_short_term
+        continue_prob_t = torch.stack(continue_prob)
+        continue_prob_var = continue_prob_t.var().item()
+        continue_prob_mean = continue_prob_t.mean().item()
+
+        returns = []
+        # Iterate through all dreamed steps
+        for t in reversed(range(len(rewards))):
             r_t = rewards[t]
-            c_t = continue_prob[t].detach()
-            v_next = values[t + 1].detach()
+            c_t = continue_prob[t] 
+            # Bootstrapped R is used for the very last step's v_next
+            v_next = values[t + 1] if t + 1 < len(values) else R 
             
             R = r_t + self.gamma * c_t * ((1 - lambda_) * v_next + lambda_ * R)
             returns.insert(0, R)
- 
-        returns_t = torch.stack(returns[:-1])
-        values_t = torch.stack(values[:-1])
-        advantages = (returns_t - values_t).detach()
-        if advantages.numel() > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        returns_t = torch.stack(returns) # No need to slice [:-1] anymore
+        entropies_t = torch.stack(entropies)
+        values_t = torch.stack(values)
+
+        logps = torch.stack(logps)                     # dist.log_prob(action_idx) per step
+        adv   = (returns_t - values_t).detach()
+        S     = (torch.quantile(returns_t.detach(), 0.95) -
+                torch.quantile(returns_t.detach(), 0.05)).clamp(min=1.0)
+        actor_loss = -(logps * adv / S).mean() - self.entropy_coef * entropies_t.mean()
+                        
+        # Make sure you also don't slice values_t if you want to regress all steps
         
-        actor_loss = -(torch.stack(log_probs[:-1]) * advantages).mean()
-        entropy_bonus = torch.stack(entropies[:-1]).mean()
         value_loss = F.mse_loss(values_t, returns_t.detach())
-    
-        loss = actor_loss - self.entropy_coef * entropy_bonus + value_loss
- 
+
+        entropy_bonus = torch.stack(entropies).mean()
+        #loss = actor_loss - self.entropy_coef * entropy_bonus + value_loss
+        loss = actor_loss + value_loss
+
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizer.step()
- 
-        return actor_loss.detach(),(-self.entropy_coef * entropy_bonus).detach(),value_loss.detach()
+
+        return actor_loss.detach(), (-self.entropy_coef * entropy_bonus).detach(), value_loss.detach(),continue_prob_var, continue_prob_mean
  
     def remember(self, proto, action, reward, priority):
         self.memory.add(Association(proto, action, reward, priority))
@@ -822,6 +787,55 @@ class Agent(nn.Module):
         self.value_center.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
+
+@torch.no_grad()
+def advance_single_episode(agent,error_tracker,world):
+    # we forward the agent a full day with the "policy" encoded in the cortex 
+    agent.waking_up()
+    error_tracker.start_episode()
+    world.reset()
+    ep_reward = 0.0
+    done = False
+    day_buffer = []
+
+    while not done:
+        viewed_world = world.observe()
+
+        protomemory = agent.perception(viewed_world)  
+        short_window = agent.memory.compact_short_memories()
+        long_payload,_ = agent.memory.compact_long_memories(protomemory)
+
+        predicted_value = agent.value_center(protomemory, short_window, long_payload)
+        proto_action = agent.cortex(protomemory, short_window, long_payload)
+        action_idx, dist = agent.action_mapper.sample(proto_action)
+
+        _, reward, done, _ = world.act(action_idx.item())
+        next_obs = world.observe()
+
+        next_value = 0.0 if done else agent.get_value(next_obs).item()
+        td_error = reward + agent.gamma * next_value - predicted_value.item()
+
+        agent.remember(
+            proto=protomemory,
+            action=proto_action,
+            reward=reward,
+            priority = abs(td_error)
+        )
+
+        day_buffer.append({
+            "obs": viewed_world,
+            "reward": torch.tensor(reward, dtype=torch.float32),
+            "next_obs": next_obs,
+            "done": torch.tensor(float(done), dtype=torch.float32),
+            "short": short_window,
+            "long": long_payload,
+            "action_idx": action_idx
+        })
+
+        ep_reward += reward
+
+    return day_buffer, ep_reward
+ 
  
 def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=False):
     world = World("CartPole-v1", render=render)
@@ -868,65 +882,76 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
                                               }
                                           )
 
-    for episode in range(num_episodes):
-        agent.waking_up()
-        error_tracker.start_episode()
+    for batches in range(50):
+        concatenated_daybuffer = []
+        for episode in range(20):
+            day_buffer, ep_reward = advance_single_episode(agent=agent, error_tracker=error_tracker, world=world)
+            concatenated_daybuffer += day_buffer
+
+        #awake_optimizer = torch.optim.Adam(
+        #            filter(lambda p: p.requires_grad, agent.parameters()), lr=lr
+        #        )
  
-        awake_optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, agent.parameters()), lr=lr
+        # values to be used
+        obs_batch = torch.stack([step["obs"] for step in concatenated_daybuffer])
+        next_obs_batch = torch.stack([step["next_obs"] for step in concatenated_daybuffer])
+        rewards_batch = torch.stack([step["reward"] for step in concatenated_daybuffer])
+        dones_batch = torch.stack([step["done"] for step in concatenated_daybuffer])
+
+        short_batch = torch.stack([step["short"] for step in concatenated_daybuffer])
+        long_batch = torch.stack([step["long"] for step in concatenated_daybuffer])
+        action_idx_batch = torch.stack([step["action_idx"] for step in concatenated_daybuffer])
+
+        action_embedding_batch = agent.action_mapper.encode(action_idx_batch)
+
+        proto_batch = agent.perception(obs_batch)          # grad flows through perception
+        recon_views = agent.decoder(proto_batch)
+
+        with torch.no_grad():
+            next_proto_targets = agent.perception(next_obs_batch)
+
+        pred_next_proto, pred_reward, pred_done_logits = agent.dreamer(
+            proto_batch, short_batch, long_batch, action_embedding_batch
         )
- 
-        world.reset()
-        done = False
-        ep_reward = 0.0
 
-        total_loss = 0.0
+        #recon_loss = F.mse_loss(recon_views, obs_batch)
+        #dynamics_loss = F.mse_loss(pred_next_proto, next_proto_targets)
+        #reward_loss = F.mse_loss(pred_reward, rewards_batch)
+        #done_loss = F.binary_cross_entropy_with_logits(pred_done_logits, dones_batch)
 
-        while not done:
-            viewed_world = world.observe()
- 
-            (_, action, predicted_value , predicted_reward,predicted_losing_probability,
-                            recreated_world_view, protomemory, predicted_next_embedding,proto_action) = agent.awake_cycle(viewed_world)
+        recon_loss_per_step = F.mse_loss(recon_views, obs_batch, reduction='none').mean(
+            dim=tuple(range(1, obs_batch.dim()))
+        )  # (T,) — averaged over all non-batch dims of obs
+        dynamics_loss_per_step = F.mse_loss(pred_next_proto, next_proto_targets, reduction='none').mean(dim=-1)  # (T,)
+        reward_loss_per_step = F.mse_loss(pred_reward.squeeze(-1), rewards_batch, reduction='none')  # (T,)
 
-           
-            _, reward, done, _ = world.act(action.item())
-            next_obs = world.observe()
-            with torch.no_grad():
-                next_proto_target = agent.perception(next_obs)
-                next_value = 0.0 if done else agent.get_value(next_obs).item()
-                td_error = reward + agent.gamma * (next_value - predicted_value.item())
+        num_done = (dones_batch == 1).sum()
+        num_not_done = (dones_batch == 0).sum()
+        pos_weight = (num_not_done / num_done.clamp(min=1)).clamp(max=20).to(pred_done_logits.device)
 
-            recon_loss = F.mse_loss(recreated_world_view, viewed_world)
-            reward_loss = F.mse_loss(predicted_reward, torch.tensor(reward, dtype=torch.float32))
-            dynamics_loss = F.mse_loss(predicted_next_embedding, next_proto_target)
-            done_loss = F.binary_cross_entropy_with_logits(
-                predicted_losing_probability, torch.tensor(float(done), dtype=torch.float32)
-            )
-            awake_loss = recon_loss + reward_loss + dynamics_loss + done_loss
-            total_loss += awake_loss
+        done_loss_per_step = F.binary_cross_entropy_with_logits(
+            pred_done_logits.squeeze(-1), dones_batch,pos_weight=pos_weight,reduction='none'
+        )  # (T,)
 
-            temp_episodic_metric_storage["reward_error"] = reward_loss.detach()
-            temp_episodic_metric_storage["encoder_decoder_error"] = recon_loss.detach()
-            temp_episodic_metric_storage["predict_next_word_state"] = dynamics_loss.detach()
-            temp_episodic_metric_storage["done_loss"] = done_loss.detach()
-            error_tracker.query_measurments()
- 
-            agent.remember(
-                proto=protomemory,
-                action=proto_action.detach(),
-                reward=reward,
-                priority = abs(td_error)
-            )
- 
-            ep_reward += reward
+        recon_loss = recon_loss_per_step.mean()
+        dynamics_loss = dynamics_loss_per_step.mean()
+        reward_loss = reward_loss_per_step.mean()
+        done_loss = done_loss_per_step.mean()
 
+        awake_loss = recon_loss + reward_loss + dynamics_loss + done_loss
 
-        awake_optimizer.zero_grad()
-        total_loss.backward()
+        agent.optimizer.zero_grad()
+        awake_loss.backward()
         torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
-        awake_optimizer.step()
+        agent.optimizer.step()
 
-        #print("!")
+        for t in range(len(day_buffer)):
+            temp_episodic_metric_storage["reward_error"] = reward_loss_per_step[t].detach()
+            temp_episodic_metric_storage["encoder_decoder_error"] = recon_loss_per_step[t].detach()
+            temp_episodic_metric_storage["predict_next_word_state"] = dynamics_loss_per_step[t].detach()
+            temp_episodic_metric_storage["done_loss"] = done_loss_per_step[t].detach()
+            error_tracker.query_measurments()
+
         error_tracker.end_episode(ep_reward)
         agent.going_to_sleep()
  
@@ -934,16 +959,20 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
             actor_loss_list = 0
             entropy_bonus_list = 0 
             value_loss_list = 0
+            continue_prob_var_list = []
+            continue_prob_mean_list = []
             for _ in range(5):
-                actor_loss,entropy_bonus,value_loss = agent.sleep(number_of_dreams=10)
+                actor_loss,entropy_bonus,value_loss,continue_prob_var, continue_prob_mean = agent.sleep(number_of_dreams=10)
                 actor_loss_list += actor_loss
                 entropy_bonus_list += entropy_bonus
                 value_loss_list += value_loss
+                continue_prob_var_list.append(continue_prob_var)
+                continue_prob_mean_list.append(continue_prob_mean)
             
-            error_tracker.append_sleep(actor_loss_list,entropy_bonus_list,value_loss)
-        if (episode + 1) % log_every == 0:
-            avg = np.mean(error_tracker.rewards[-log_every:])
-            print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
+            error_tracker.append_sleep(actor_loss_list,entropy_bonus_list,value_loss,np.mean(continue_prob_var_list),np.mean(continue_prob_mean))
+
+        avg = np.mean(error_tracker.rewards[-log_every:])
+        print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
  
     return agent, error_tracker
  
@@ -958,22 +987,26 @@ def watch(agent, num_episodes=1, render=True):
         while not done:
             obs_t = world.observe()
             with torch.no_grad():
-                (action_logits, action, predicted_value, predicted_reward,predicted_losing_probability,
-                                            recreated_world_view, protomemory, predicted_next_embedding,proto_action) = agent.awake_cycle(obs_t)
-                 
-            action = torch.argmax(action_logits)
-            _, reward, done, _ = world.act(action.item())
+                protomemory = agent.perception(obs_t)
+                short_window = agent.memory.compact_short_memories()
+                long_payload, _ = agent.memory.compact_long_memories(protomemory)
+
+                predicted_value = agent.value_center(protomemory, short_window, long_payload)
+                proto_action = agent.cortex(protomemory, short_window, long_payload)
+                action_idx, _ = agent.action_mapper.sample(proto_action)
+
+            _, reward, done, _ = world.act(action_idx.item())
             next_obs = world.observe()
             with torch.no_grad():
-                next_proto_target = agent.perception(next_obs)
                 next_value = 0.0 if done else agent.get_value(next_obs).item()
                 td_error = reward + agent.gamma * next_value - predicted_value.item()
+
             captured_frames.append(world.env.render())
             agent.remember(proto=protomemory, action=proto_action.detach(), reward=reward, priority=abs(td_error))
- 
+
             ep_reward += reward
         print(f"[watch] Episode {episode + 1}: reward = {ep_reward:.0f}")
- 
+
     world.close()
     return captured_frames
  
