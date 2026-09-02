@@ -322,7 +322,7 @@ class Association:
 # Unclear. My instinct is to train it at night only
 class Memory(nn.Module):
     def __init__(self, d_model, d_action, query_short_memories=5, query_long_memories=5,
-                 num_heads=2, short_capacity=8, long_capacity=64):
+                 num_heads=2, short_capacity=8, long_capacity=128):
         super().__init__()
         self.short_term = collections.deque(maxlen=short_capacity)
         self.long_term = []
@@ -572,8 +572,9 @@ class ActionMapper(nn.Module):
 
     def compute_scores(self, proto_action: torch.Tensor) -> torch.Tensor:
         # Normalize vectors for cosine similarity stability if desired
-        proto_norm = F.normalize(proto_action, p=2, dim=-1)
-        codebook_norm = F.normalize(self.codebook.weight, p=2, dim=-1)
+        proto_norm    = F.normalize(proto_action, p=2, dim=-1, eps=1e-6)
+        codebook_norm = F.normalize(self.codebook.weight, p=2, dim=-1, eps=1e-6)
+
         
         # Similarity score: (..., d_action) x (d_action, n_actions) -> (..., n_actions)
         scores = (proto_norm @ codebook_norm.t()) / self.temperature
@@ -612,8 +613,6 @@ class Cortex(DualBranchHead):
             nn.ELU(),
             nn.Linear(d_model, d_action),
         )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, protomemory, short_term_window, long_term_payload):
         fused, single = self.fuse(protomemory, short_term_window, long_term_payload)
@@ -678,6 +677,161 @@ class DreamerCenter(DualBranchHead):
             continuation_prob.squeeze(0) if single else continuation_prob
         )
 
+
+### DEBUG functions ----------------------------
+
+def actor_gradient_breakdown(agent, pathwise, entropy_bonus):
+    params = [p for p in agent.cortex.parameters() if p.requires_grad]
+ 
+    g_task = torch.autograd.grad(pathwise, params,
+                                 retain_graph=True, allow_unused=True)
+    g_ent = torch.autograd.grad(-agent.entropy_coef * entropy_bonus, params,
+                                retain_graph=True, allow_unused=True)
+ 
+    def norm(gs):
+        return sum(g.pow(2).sum().item() for g in gs if g is not None) ** 0.5
+ 
+    return norm(g_task), norm(g_ent)
+
+@torch.no_grad()
+def action_sensitivity(agent, seed_protos, seed_windows, horizon=15, n=64,
+                       lambda_=0.95):
+    idx = torch.randint(seed_protos.shape[0], (n,))
+    kv = agent.memory.long_memory_kv()
+ 
+    per_action_return = {}
+    per_action_reward = {}
+    per_action_cont = {}
+ 
+    for forced in range(agent.n_actions):
+        torch.manual_seed(0)          # same action noise after step 0
+        z = seed_protos[idx].clone()
+        window = seed_windows[idx].clone()
+ 
+        disc = torch.ones(n)
+        total_r = torch.zeros(n)
+        sum_reward = torch.zeros(n)
+        sum_cont = torch.zeros(n)
+ 
+        for t in range(horizon):
+            pay = agent.memory.attend_long(z, kv)
+            proto_action = agent.cortex(z, window, pay)
+ 
+            if t == 0:
+                a = torch.full((n,), forced, dtype=torch.long)
+            else:
+                a, _ = agent.action_mapper.sample(proto_action)
+            emb = agent.action_mapper.encode(a)
+ 
+            z_next, r, done_logit = agent.dreamer(z, window, pay, emb)
+            c = torch.sigmoid(-done_logit)
+ 
+            total_r = total_r + disc * r
+            disc = disc * agent.gamma * c
+            sum_reward = sum_reward + r
+            sum_cont = sum_cont + c
+ 
+            new_step = torch.cat([z, emb, r.unsqueeze(-1)], dim=-1)
+            window = torch.cat([window[:, 1:], new_step.unsqueeze(1)], dim=1)
+            z = z_next
+ 
+        per_action_return[forced] = total_r
+        per_action_reward[forced] = sum_reward
+        per_action_cont[forced] = sum_cont
+ 
+    stack = lambda d: torch.stack([d[a] for a in range(agent.n_actions)])
+    return {
+        "return_spread": (stack(per_action_return).max(0).values
+                          - stack(per_action_return).min(0).values).mean().item(),
+        "reward_spread": (stack(per_action_reward).max(0).values
+                          - stack(per_action_reward).min(0).values).mean().item(),
+        "cont_spread": (stack(per_action_cont).max(0).values
+                        - stack(per_action_cont).min(0).values).mean().item(),
+        "return_mean": stack(per_action_return).mean().item(),
+    }
+
+
+
+def channel_decomposition(agent, rewards, conts, values, w, S,
+                          gamma, lambda_):
+    horizon = len(rewards)
+    params = [p for p in agent.cortex.parameters() if p.requires_grad]
+ 
+    def lam_return(rs, cs):
+        R = values[horizon]
+        out = []
+        for t in reversed(range(horizon)):
+            R = rs[t] + gamma * cs[t] * ((1 - lambda_) * values[t + 1] + lambda_ * R)
+            out.insert(0, R)
+        return torch.stack(out)
+ 
+    def gnorm(loss):
+        gs = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+        return sum(g.pow(2).sum().item() for g in gs if g is not None) ** 0.5
+ 
+    r_d = [r.detach() for r in rewards]
+    c_d = [c.detach() for c in conts]
+ 
+    return {
+        "full":      gnorm(-(w * lam_return(rewards, conts) / S).sum()),
+        "no_cont":   gnorm(-(w * lam_return(rewards, c_d) / S).sum()),
+        "no_reward": gnorm(-(w * lam_return(r_d, conts) / S).sum()),
+    }
+
+@torch.no_grad()
+def open_loop_error(agent, day_buffer, horizon=15):
+    if len(day_buffer) < horizon + 1:
+        return None
+ 
+    start = 0
+    obs = torch.stack([s["obs"] for s in day_buffer])
+    true_protos = agent.perception(obs)                     # (T, d_model)
+    proto_scale = true_protos.var(dim=0).mean().item()      # reference variance
+ 
+    z = true_protos[start:start + 1]
+    window = day_buffer[start]["short"].unsqueeze(0)
+    kv = agent.memory.long_memory_kv()
+ 
+    mse_by_k, reward_err_by_k, cont_by_k = [], [], []
+ 
+    for k in range(horizon):
+        pay = agent.memory.attend_long(z, kv)
+        a = day_buffer[start + k]["action_idx"].view(1)     # replay the REAL action
+        emb = agent.action_mapper.encode(a)
+        z_next, r, done_logit = agent.dreamer(z, window, pay, emb)
+ 
+        target = true_protos[start + k + 1:start + k + 2]
+        mse_by_k.append(F.mse_loss(z_next, target).item())
+        reward_err_by_k.append((r - day_buffer[start + k]["reward"]).abs().item())
+        cont_by_k.append(torch.sigmoid(-done_logit).item())
+ 
+        new_step = torch.cat([z, emb, r.unsqueeze(-1)], dim=-1)
+        window = torch.cat([window[:, 1:], new_step.unsqueeze(1)], dim=1)
+        z = z_next
+ 
+    return {"mse_by_k": mse_by_k,
+            "reward_err_by_k": reward_err_by_k,
+            "cont_by_k": cont_by_k,
+            "proto_variance": proto_scale}
+
+
+def policy_stats(dist):
+    probs = dist.probs.detach()
+    return {
+        "mean_max_prob": probs.max(dim=-1).values.mean().item(),
+        "entropy": dist.entropy().mean().item(),
+        "p0": probs[..., 0].mean().item(),
+    }
+
+def realised_discounted_return(day_buffer, gamma=0.99):
+    total, disc = 0.0, 1.0
+    for step in day_buffer:
+        total += disc * float(step["reward"])
+        disc *= gamma
+    return total
+
+
+
 class Agent(nn.Module):
     def __init__(self, world, d_model=128, d_action = 16, num_heads=2, lr=1e-3, gamma=0.99, entropy_coef=0.05):
         super().__init__()
@@ -700,18 +854,29 @@ class Agent(nn.Module):
                                     long_term_dim=self.memory.attn_dim)
         self.value_center = ValueCenter(d_model, d_action, self.memory.query_short_memories, self.memory.attn_dim)
         self.action_mapper = ActionMapper(n_actions=world.n_actions, d_action=d_action)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
+        self.optimizer = torch.optim.Adam(
+            list(self.perception.parameters())
+            + list(self.decoder.parameters())
+            + list(self.dreamer.parameters())
+            + list(self.action_mapper.parameters())
+            + list(self.memory.parameters()),
+            lr=lr,
+        )
+
+        self.cortex_optimizer =  torch.optim.Adam(self.cortex.parameters(),lr=8e-5)
+        self.value_optimizer =  torch.optim.Adam(self.value_center.parameters(),lr=8e-5)
  
     def waking_up(self):
         self.memory.short_term.clear()
         self.cortex.freeze_weights()
         self.value_center.freeze_weights()
+        self.memory.freeze_weights()
         self.dreamer.activate_weights()
         self.action_mapper.activate_weights()
         self.perception.activate_weights()
         self.decoder.activate_weights()
-        self.memory.activate_weights()
+        
         self.is_asleep = False
 
     @torch.no_grad()
@@ -724,17 +889,17 @@ class Agent(nn.Module):
     def going_to_sleep(self):
         self.memory.short_term.clear()
         self.cortex.activate_weights()
+        self.memory.activate_weights()
         self.value_center.activate_weights()
         self.dreamer.freeze_weights()
         self.action_mapper.freeze_weights()
-        self.memory.freeze_weights()
         self.perception.freeze_weights()
         self.decoder.freeze_weights()
         self.is_asleep = True
 
 
-    def sleep(self,horizon=15, dream_batch=32, lambda_=0.95,
-          seed_protos=None, seed_windows=None):
+    def sleep(self,horizon=15, dream_batch=32, lambda_=0.95, 
+          seed_protos=None, seed_windows=None, rho = 0.0):
 
         if seed_protos is None:
             z = self.memory.sample_long_term_protos(dream_batch)
@@ -750,12 +915,15 @@ class Agent(nn.Module):
         B = z.shape[0]
         kv = self.memory.long_memory_kv()
 
-
-        values, rewards, entropies, conts, logps = [], [], [], [], []
+        z_seq, win_seq, pay_seq = [],[],[]
+        rewards, entropies, conts, logps = [], [], [], []
 
         for _ in range(horizon):
             long_payload = self.memory.attend_long(z, kv)            # (B, attn_dim)
-    
+            z_seq.append(z)
+            win_seq.append(window)
+            pay_seq.append(long_payload)
+
             proto_action = self.cortex(z, window, long_payload)      # (B, d_action)
             action_idx, dist = self.action_mapper.sample(proto_action)   # (B,)
             probs = dist.probs                                       # (B, n_actions)
@@ -768,66 +936,100 @@ class Agent(nn.Module):
             c = torch.sigmoid(-done_logit)                           # (B,) P(continue)
     
             logps.append(dist.log_prob(action_idx))
-            values.append(v)
             rewards.append(r)
             conts.append(c)
             entropies.append(dist.entropy())
     
             # roll the per-rollout window. Layout must match Association.compact():
             # [proto, action_embedding, reward]
-            new_step = torch.cat([z, action_embedding, r.unsqueeze(-1)], dim=-1).detach()
+            new_step = torch.cat([z, action_embedding, r.unsqueeze(-1)], dim=-1)
             window = torch.cat([window[:, 1:], new_step.unsqueeze(1)], dim=1)
     
             z = z_next          # no detach: gradient flows through the dynamics chain
 
 
+
+
         # ---- bootstrap ---------------------------------------------------------
         long_payload = self.memory.attend_long(z, kv)
-        R = self.value_center(z, window, long_payload)               # (B,)
+        z_seq.append(z)
+        win_seq.append(window)
+        pay_seq.append(long_payload)
+
+        values = [self.value_center(z_seq[t],win_seq[t],pay_seq[t]) for t in range(horizon +1)]
+
+        R = values[horizon]             # (B,)
     
         returns = []
         for t in reversed(range(horizon)):
-            v_next = values[t + 1] if t + 1 < horizon else R
+            v_next = values[t + 1]
             R = rewards[t] + self.gamma * conts[t] * ((1 - lambda_) * v_next + lambda_ * R)
             returns.insert(0, R)
     
         returns_t = torch.stack(returns)                             # (T, B)
-        values_t = torch.stack(values)                               # (T, B)
         logps_t = torch.stack(logps)                                 # (T, B)
         ent_t = torch.stack(entropies)                               # (T, B)
         cont_t = torch.stack(conts)                                  # (T, B)
     
         # ---- termination-aware weighting ---------------------------------------
-        # Step t only "exists" with probability prod(c_0..c_{t-1}). Without this,
-        # deep steps of rollouts the model believes are already dead get full
-        # weight in the loss. Matters much more at horizon 15+ than at 10.
         with torch.no_grad():
             ones = torch.ones_like(cont_t[:1])
             w = torch.cumprod(torch.cat([ones, cont_t[:-1]], dim=0), dim=0)   # (T, B)
             w = w / w.sum().clamp(min=1e-8)
-    
-        adv = (returns_t - values_t).detach()
-        S = (torch.quantile(returns_t.detach(), 0.95) -
-            torch.quantile(returns_t.detach(), 0.05)).clamp(min=1.0)
-    
-        actor_loss = -(w * (logps_t * adv / S)).sum()
+            S = (torch.quantile(returns_t.detach(), 0.95) -
+                        torch.quantile(returns_t.detach(), 0.05)).clamp(min=1.0)
+
+        channel_decomposition(self, rewards, conts, values, w, S,self.gamma, lambda_)
+
+        # ---- actor ---------------------------------------
+        pathwise = -(w * returns_t / S).sum()
+        if rho > 0.0:
+            with torch.no_grad():
+                adv = returns_t - torch.stack(values[:horizon])
+            reinforce = -(w * logps_t * adv / S).sum()
+            actor_obj = rho * reinforce + (1.0 - rho) * pathwise
+        else:
+            actor_obj = pathwise
+
         entropy_bonus = (w * ent_t).sum()
-        actor_loss = actor_loss - self.entropy_coef * entropy_bonus
-    
-        value_loss = (w * (values_t - returns_t.detach()).pow(2)).sum()
-    
-        loss = actor_loss + value_loss
-    
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-        self.optimizer.step()
-    
+        actor_loss = actor_obj - self.entropy_coef * entropy_bonus
+ 
+        # ---- critic: detached states, detached targets --------------------------
+        # Separate forward pass so the critic's regression cannot push gradient
+        # back into the cortex through the imagined state chain.
+        values_d = torch.stack([
+            self.value_center(z_seq[t].detach(), win_seq[t].detach(), pay_seq[t].detach())
+            for t in range(horizon)
+        ])                                                           # (T, B)
+        value_loss = (w * (values_d - returns_t.detach()).pow(2)).sum()
+
+        actor_gradient_breakdown(self, pathwise, entropy_bonus)
+
+ 
+        # ---- two backward passes, disjoint parameter sets -----------------------
+        # actor_loss.backward() also deposits gradient on value_center (values[t+1]
+        # sits inside the return).  That gradient is not the critic's objective, so
+        # it is cleared before the critic's own backward.  This reproduces the
+        # semantics of Dreamer's separate gradient tapes.
+        self.cortex_optimizer.zero_grad(set_to_none=True)
+        self.value_optimizer.zero_grad(set_to_none=True)
+
+        actor_loss.backward()
+        self.value_optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+ 
+        torch.nn.utils.clip_grad_norm_(self.cortex.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.value_center.parameters(), max_norm=1.0)
+ 
+        self.cortex_optimizer.step()
+        self.value_optimizer.step()
+ 
         return (actor_loss.detach(),
                 (-self.entropy_coef * entropy_bonus).detach(),
                 value_loss.detach(),
                 cont_t.var().item(),
                 cont_t.mean().item())
+
  
     def remember(self, proto, action, reward, priority):
         self.memory.add(Association(proto, action, reward, priority))
@@ -840,14 +1042,15 @@ class Agent(nn.Module):
         self.decoder.freeze_weights()
 
 @torch.no_grad()
-def advance_single_episode(agent,error_tracker,world):
+def advance_single_episode(agent,world):
     # we forward the agent a full day with the "policy" encoded in the cortex 
     agent.waking_up()
-    error_tracker.start_episode()
     world.reset()
     ep_reward = 0.0
     done = False
     day_buffer = []
+
+    observation_data = []
 
     while not done:
         viewed_world = world.observe()
@@ -859,16 +1062,21 @@ def advance_single_episode(agent,error_tracker,world):
         predicted_value = agent.value_center(protomemory, short_window, long_payload)
         proto_action = agent.cortex(protomemory, short_window, long_payload)
         action_idx, dist = agent.action_mapper.sample(proto_action)
+        action_embedding_batch = agent.action_mapper.encode(action_idx)
 
-        _, reward, done, _ = world.act(action_idx.item())
+        obs_vec, reward, done, _ = world.act(action_idx.item())
+        #angle = float(obs_vec[2])
+        #reward = 1.0 - abs(angle) / 0.2095
         next_obs = world.observe()
+
+        observation_data.append(policy_stats(dist))
 
         next_value = 0.0 if done else agent.get_value(next_obs).item()
         td_error = reward + agent.gamma * next_value - predicted_value.item()
-
+         
         agent.remember(
             proto=protomemory,
-            action=proto_action,
+            action=action_embedding_batch,
             reward=reward,
             priority = abs(td_error)
         )
@@ -938,7 +1146,7 @@ def train(day_batch_size = 32, sleep_batch_size = 32 ,num_episodes=50, sleep_upd
         buffer_of_day_buffers = []
         reward_buffer = []
         for episode in range(day_batch_size):
-            day_buffer, ep_reward = advance_single_episode(agent=agent, error_tracker=error_tracker, world=world)
+            day_buffer, ep_reward = advance_single_episode(agent=agent, world=world)
             concatenated_daybuffer += day_buffer
             buffer_of_day_buffers.append(day_buffer)
             reward_buffer.append(ep_reward)
@@ -991,8 +1199,29 @@ def train(day_batch_size = 32, sleep_batch_size = 32 ,num_episodes=50, sleep_upd
         torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
         agent.optimizer.step()
 
+        with torch.no_grad():
+            fresh_protos = agent.perception(obs_batch)
+        action_sensitivity(agent, fresh_protos, short_batch, horizon=15, n=64, lambda_=0.95)
+
+        longest = max(buffer_of_day_buffers, key=len)
+        ol = open_loop_error(agent, longest, horizon=15)
+        if ol is not None:
+            k1, k5, k15 = ol["mse_by_k"][0], ol["mse_by_k"][4], ol["mse_by_k"][14]
+
+        real_G = np.mean([realised_discounted_return(db, gamma=agent.gamma)
+                          for db in buffer_of_day_buffers])
+
+        with torch.no_grad():
+            pay = agent.memory.attend_long(fresh_protos, agent.memory.long_memory_kv())
+            dream_V = agent.value_center(fresh_protos, short_batch, pay).mean().item()
+
+        print(f"value calib | critic V(s0)={dream_V:.2f}  realised G={real_G:.2f}  "
+              f"ratio={dream_V / max(real_G, 1e-6):.2f}")
+
         t = 0
+        batch_tracker = 0
         for day_buffer in buffer_of_day_buffers:
+            error_tracker.start_episode()
             for _ in range(len(day_buffer)):
                 temp_episodic_metric_storage["reward_error"] = reward_loss_per_step[t].detach()
                 temp_episodic_metric_storage["encoder_decoder_error"] = recon_loss_per_step[t].detach()
@@ -1000,8 +1229,9 @@ def train(day_batch_size = 32, sleep_batch_size = 32 ,num_episodes=50, sleep_upd
                 temp_episodic_metric_storage["done_loss"] = done_loss_per_step[t].detach()
                 error_tracker.query_measurments()
                 t += 1
-
-        error_tracker.end_episode(ep_reward)
+            error_tracker.end_episode(reward_buffer[batch_tracker])
+            batch_tracker += 1
+                
         agent.going_to_sleep()
  
         if len(agent.memory) > 0:
@@ -1030,7 +1260,7 @@ def train(day_batch_size = 32, sleep_batch_size = 32 ,num_episodes=50, sleep_upd
  
     return agent, error_tracker
  
- 
+@torch.no_grad()
 def watch(agent, num_episodes=1, render=True):
     world = World("CartPole-v1", render=render)
     captured_frames = []
@@ -1048,6 +1278,7 @@ def watch(agent, num_episodes=1, render=True):
                 predicted_value = agent.value_center(protomemory, short_window, long_payload)
                 proto_action = agent.cortex(protomemory, short_window, long_payload)
                 action_idx, _ = agent.action_mapper.sample(proto_action)
+                action_embedding_batch = agent.action_mapper.encode(action_idx)
 
             _, reward, done, _ = world.act(action_idx.item())
             next_obs = world.observe()
@@ -1056,7 +1287,7 @@ def watch(agent, num_episodes=1, render=True):
                 td_error = reward + agent.gamma * next_value - predicted_value.item()
 
             captured_frames.append(world.env.render())
-            agent.remember(proto=protomemory, action=proto_action.detach(), reward=reward, priority=abs(td_error))
+            agent.remember(proto=protomemory, action=action_embedding_batch.detach(), reward=reward, priority=abs(td_error))
 
             ep_reward += reward
         print(f"[watch] Episode {episode + 1}: reward = {ep_reward:.0f}")
@@ -1068,7 +1299,7 @@ def watch(agent, num_episodes=1, render=True):
 if __name__ == "__main__":
     # The loop is simple:
     # we train it for a number of episodes
-    trained_brain, error_tracker = train(num_episodes=50, render=False)
+    trained_brain, error_tracker = train(num_episodes=100, render=False)
     trained_brain.freeze_all()
     # we then just force the brain to move in the world
     captured_frames = watch(trained_brain, num_episodes=1, render=True)
