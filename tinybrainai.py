@@ -376,6 +376,46 @@ class Memory(nn.Module):
         output, attn_weights = self.attention(q_embed, key, values)
         return output.view(-1), attn_weights.view(-1)  # (attn_dim,), (N,)
 
+    def long_memory_kv(self):
+        """
+        Build the attention keys/values ONCE per sleep call. long_term does not
+        change while dreaming, so rebuilding this every step (as the current code
+        does) is pure waste.
+        Returns (k, v) or None if long-term memory is empty.
+        """
+        if len(self.long_term) == 0:
+            return None
+        k = torch.stack([t.proto for t in self.long_term])          # (N, d_model)
+        v = torch.stack([t.compact() for t in self.long_term])      # (N, step_dim)
+        return k, v
+    
+    def attend_long(self, query, kv):
+        """
+        Batched version of compact_long_memories.
+        query: (B, d_model)  ->  (B, attn_dim)
+        """
+        B = query.shape[0]
+        if kv is None:
+            return query.new_zeros(B, self.attn_dim)
+        k, v = kv
+        q = self.q_proj(query).unsqueeze(1)                          # (B, 1, attn_dim)
+        out, _ = self.attention(
+            q,
+            k.unsqueeze(0).expand(B, -1, -1),                        # (B, N, d_model)
+            v.unsqueeze(0).expand(B, -1, -1),                        # (B, N, step_dim)
+        )
+        return out.squeeze(1)                                        # (B, attn_dim)
+    
+    def empty_short_window(self, B, ref):
+        """Zero-padded short-term window, one per rollout: (B, K, step_dim)."""
+        width = self.d_model + self.d_action + 1
+        return ref.new_zeros(B, self.query_short_memories, width)
+    
+    
+    def sample_long_term_protos(self, B):
+        idx = torch.randint(len(self.long_term), (B,))
+        return torch.stack([self.long_term[i].proto for i in idx])
+
     def raw_long_memories(self):
         return self.long_term
 
@@ -693,90 +733,101 @@ class Agent(nn.Module):
         self.is_asleep = True
 
 
-    def sleep(self, number_of_dreams, lambda_=0.95):
-        values, rewards, entropies, continue_prob,logps = [], [], [], [], []
-        saved_short_term = collections.deque(self.memory.short_term, maxlen=self.memory.short_term.maxlen)
+    def sleep(self,horizon=15, dream_batch=32, lambda_=0.95,
+          seed_protos=None, seed_windows=None):
 
-        dreamed_previous_embedding = self.memory.random_long_term_memory().proto  # leaf, fine to start detached
+        if seed_protos is None:
+            z = self.memory.sample_long_term_protos(dream_batch)
+            window = self.memory.empty_short_window(dream_batch, z)
+        else:
+            idx = torch.randint(seed_protos.shape[0], (dream_batch,))
+            z = seed_protos[idx].detach()                            # (B, d_model)
+            if seed_windows is None:
+                window = self.memory.empty_short_window(dream_batch, z)
+            else:
+                window = seed_windows[idx].detach()                  # (B, K, step_dim)
 
-        for i in range(number_of_dreams):
-            short_window = self.memory.compact_short_memories()
-            long_payload, _ = self.memory.compact_long_memories(dreamed_previous_embedding)
+        B = z.shape[0]
+        kv = self.memory.long_memory_kv()
 
-            proto_action = self.cortex(dreamed_previous_embedding, short_window, long_payload)
-            action_idx, dist = self.action_mapper.sample(proto_action)  # keep for logging/entropy only
-            probs = dist.probs
+
+        values, rewards, entropies, conts, logps = [], [], [], [], []
+
+        for _ in range(horizon):
+            long_payload = self.memory.attend_long(z, kv)            # (B, attn_dim)
+    
+            proto_action = self.cortex(z, window, long_payload)      # (B, d_action)
+            action_idx, dist = self.action_mapper.sample(proto_action)   # (B,)
+            probs = dist.probs                                       # (B, n_actions)
             onehot = F.one_hot(action_idx, self.n_actions).float()
-            st = onehot + probs - probs.detach()          # forward = onehot, backward = d/dprobs
-            action_embedding = st @ self.action_mapper.codebook.weight
-
-            predicted_value = self.value_center(dreamed_previous_embedding, short_window, long_payload)
-            dreamed_next_embedding, predicted_reward, predicted_losing_probability = self.dreamer(
-                dreamed_previous_embedding, short_window, long_payload, action_embedding
-            )
-            predicted_continue_prob = torch.sigmoid(-predicted_losing_probability)
-
+            st = onehot + probs - probs.detach()                     # straight-through
+            action_embedding = st @ self.action_mapper.codebook.weight    # (B, d_action)
+    
+            v = self.value_center(z, window, long_payload)           # (B,)
+            z_next, r, done_logit = self.dreamer(z, window, long_payload, action_embedding)
+            c = torch.sigmoid(-done_logit)                           # (B,) P(continue)
+    
             logps.append(dist.log_prob(action_idx))
-            continue_prob.append(predicted_continue_prob)   # DON'T detach — need gradient for analytic path
-            values.append(predicted_value.squeeze())
-            rewards.append(predicted_reward)
+            values.append(v)
+            rewards.append(r)
+            conts.append(c)
             entropies.append(dist.entropy())
+    
+            # roll the per-rollout window. Layout must match Association.compact():
+            # [proto, action_embedding, reward]
+            new_step = torch.cat([z, action_embedding, r.unsqueeze(-1)], dim=-1).detach()
+            window = torch.cat([window[:, 1:], new_step.unsqueeze(1)], dim=1)
+    
+            z = z_next          # no detach: gradient flows through the dynamics chain
 
-            # still add a DETACHED copy to memory — you don't want this graph living in the deque
-            self.memory.add_short_term(Association(
-                proto=dreamed_previous_embedding.detach(),
-                action_embedding=action_embedding.detach(),
-                reward=predicted_reward.detach(),
-                priority=0.0,
-            ))
 
-            dreamed_previous_embedding = dreamed_next_embedding   # NO .detach() — keep the chain alive
-
-        # bootstrap final value, still connected to the graph
-        short_window = self.memory.compact_short_memories()
-        long_payload, _ = self.memory.compact_long_memories(dreamed_next_embedding)
-        R = self.value_center(dreamed_next_embedding, short_window, long_payload).squeeze()
-
-        self.memory.short_term = saved_short_term
-        continue_prob_t = torch.stack(continue_prob)
-        continue_prob_var = continue_prob_t.var().item()
-        continue_prob_mean = continue_prob_t.mean().item()
-
+        # ---- bootstrap ---------------------------------------------------------
+        long_payload = self.memory.attend_long(z, kv)
+        R = self.value_center(z, window, long_payload)               # (B,)
+    
         returns = []
-        # Iterate through all dreamed steps
-        for t in reversed(range(len(rewards))):
-            r_t = rewards[t]
-            c_t = continue_prob[t] 
-            # Bootstrapped R is used for the very last step's v_next
-            v_next = values[t + 1] if t + 1 < len(values) else R 
-            
-            R = r_t + self.gamma * c_t * ((1 - lambda_) * v_next + lambda_ * R)
+        for t in reversed(range(horizon)):
+            v_next = values[t + 1] if t + 1 < horizon else R
+            R = rewards[t] + self.gamma * conts[t] * ((1 - lambda_) * v_next + lambda_ * R)
             returns.insert(0, R)
-
-        returns_t = torch.stack(returns) # No need to slice [:-1] anymore
-        entropies_t = torch.stack(entropies)
-        values_t = torch.stack(values)
-
-        logps = torch.stack(logps)                     # dist.log_prob(action_idx) per step
-        adv   = (returns_t - values_t).detach()
-        S     = (torch.quantile(returns_t.detach(), 0.95) -
-                torch.quantile(returns_t.detach(), 0.05)).clamp(min=1.0)
-        actor_loss = -(logps * adv / S).mean() - self.entropy_coef * entropies_t.mean()
-                        
-        # Make sure you also don't slice values_t if you want to regress all steps
-        
-        value_loss = F.mse_loss(values_t, returns_t.detach())
-
-        entropy_bonus = torch.stack(entropies).mean()
-        #loss = actor_loss - self.entropy_coef * entropy_bonus + value_loss
+    
+        returns_t = torch.stack(returns)                             # (T, B)
+        values_t = torch.stack(values)                               # (T, B)
+        logps_t = torch.stack(logps)                                 # (T, B)
+        ent_t = torch.stack(entropies)                               # (T, B)
+        cont_t = torch.stack(conts)                                  # (T, B)
+    
+        # ---- termination-aware weighting ---------------------------------------
+        # Step t only "exists" with probability prod(c_0..c_{t-1}). Without this,
+        # deep steps of rollouts the model believes are already dead get full
+        # weight in the loss. Matters much more at horizon 15+ than at 10.
+        with torch.no_grad():
+            ones = torch.ones_like(cont_t[:1])
+            w = torch.cumprod(torch.cat([ones, cont_t[:-1]], dim=0), dim=0)   # (T, B)
+            w = w / w.sum().clamp(min=1e-8)
+    
+        adv = (returns_t - values_t).detach()
+        S = (torch.quantile(returns_t.detach(), 0.95) -
+            torch.quantile(returns_t.detach(), 0.05)).clamp(min=1.0)
+    
+        actor_loss = -(w * (logps_t * adv / S)).sum()
+        entropy_bonus = (w * ent_t).sum()
+        actor_loss = actor_loss - self.entropy_coef * entropy_bonus
+    
+        value_loss = (w * (values_t - returns_t.detach()).pow(2)).sum()
+    
         loss = actor_loss + value_loss
-
+    
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.optimizer.step()
-
-        return actor_loss.detach(), (-self.entropy_coef * entropy_bonus).detach(), value_loss.detach(),continue_prob_var, continue_prob_mean
+    
+        return (actor_loss.detach(),
+                (-self.entropy_coef * entropy_bonus).detach(),
+                value_loss.detach(),
+                cont_t.var().item(),
+                cont_t.mean().item())
  
     def remember(self, proto, action, reward, priority):
         self.memory.add(Association(proto, action, reward, priority))
@@ -837,9 +888,9 @@ def advance_single_episode(agent,error_tracker,world):
     return day_buffer, ep_reward
  
  
-def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=False):
+def train(day_batch_size = 32, sleep_batch_size = 32 ,num_episodes=50, sleep_updates=20, lr=1e-3, log_every=20, render=False):
     world = World("CartPole-v1", render=render)
-    agent = Agent(world, d_model=32, lr=lr)
+    agent = Agent(world, d_model=128, lr=lr)
     error_tracker = ErrorTracking()
 
     temp_episodic_metric_storage = {"reward_error" : 0.0,
@@ -882,16 +933,16 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
                                               }
                                           )
 
-    for batches in range(50):
+    for batches in range(num_episodes):
         concatenated_daybuffer = []
-        for episode in range(20):
+        buffer_of_day_buffers = []
+        reward_buffer = []
+        for episode in range(day_batch_size):
             day_buffer, ep_reward = advance_single_episode(agent=agent, error_tracker=error_tracker, world=world)
             concatenated_daybuffer += day_buffer
+            buffer_of_day_buffers.append(day_buffer)
+            reward_buffer.append(ep_reward)
 
-        #awake_optimizer = torch.optim.Adam(
-        #            filter(lambda p: p.requires_grad, agent.parameters()), lr=lr
-        #        )
- 
         # values to be used
         obs_batch = torch.stack([step["obs"] for step in concatenated_daybuffer])
         next_obs_batch = torch.stack([step["next_obs"] for step in concatenated_daybuffer])
@@ -914,14 +965,9 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
             proto_batch, short_batch, long_batch, action_embedding_batch
         )
 
-        #recon_loss = F.mse_loss(recon_views, obs_batch)
-        #dynamics_loss = F.mse_loss(pred_next_proto, next_proto_targets)
-        #reward_loss = F.mse_loss(pred_reward, rewards_batch)
-        #done_loss = F.binary_cross_entropy_with_logits(pred_done_logits, dones_batch)
-
         recon_loss_per_step = F.mse_loss(recon_views, obs_batch, reduction='none').mean(
             dim=tuple(range(1, obs_batch.dim()))
-        )  # (T,) — averaged over all non-batch dims of obs
+        ) 
         dynamics_loss_per_step = F.mse_loss(pred_next_proto, next_proto_targets, reduction='none').mean(dim=-1)  # (T,)
         reward_loss_per_step = F.mse_loss(pred_reward.squeeze(-1), rewards_batch, reduction='none')  # (T,)
 
@@ -945,34 +991,42 @@ def train(num_episodes=1000, number_of_dreams=20, lr=1e-3, log_every=20, render=
         torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
         agent.optimizer.step()
 
-        for t in range(len(day_buffer)):
-            temp_episodic_metric_storage["reward_error"] = reward_loss_per_step[t].detach()
-            temp_episodic_metric_storage["encoder_decoder_error"] = recon_loss_per_step[t].detach()
-            temp_episodic_metric_storage["predict_next_word_state"] = dynamics_loss_per_step[t].detach()
-            temp_episodic_metric_storage["done_loss"] = done_loss_per_step[t].detach()
-            error_tracker.query_measurments()
+        t = 0
+        for day_buffer in buffer_of_day_buffers:
+            for _ in range(len(day_buffer)):
+                temp_episodic_metric_storage["reward_error"] = reward_loss_per_step[t].detach()
+                temp_episodic_metric_storage["encoder_decoder_error"] = recon_loss_per_step[t].detach()
+                temp_episodic_metric_storage["predict_next_word_state"] = dynamics_loss_per_step[t].detach()
+                temp_episodic_metric_storage["done_loss"] = done_loss_per_step[t].detach()
+                error_tracker.query_measurments()
+                t += 1
 
         error_tracker.end_episode(ep_reward)
         agent.going_to_sleep()
  
         if len(agent.memory) > 0:
-            actor_loss_list = 0
-            entropy_bonus_list = 0 
-            value_loss_list = 0
-            continue_prob_var_list = []
-            continue_prob_mean_list = []
-            for _ in range(5):
-                actor_loss,entropy_bonus,value_loss,continue_prob_var, continue_prob_mean = agent.sleep(number_of_dreams=10)
-                actor_loss_list += actor_loss
-                entropy_bonus_list += entropy_bonus
-                value_loss_list += value_loss
-                continue_prob_var_list.append(continue_prob_var)
-                continue_prob_mean_list.append(continue_prob_mean)
-            
-            error_tracker.append_sleep(actor_loss_list,entropy_bonus_list,value_loss,np.mean(continue_prob_var_list),np.mean(continue_prob_mean))
+            a_sum = e_sum = v_sum = 0.0
+            cp_var, cp_mean = [], []
+            seed_protos = proto_batch.detach()
+            for _ in range(sleep_updates):              # e.g. 20 -- cheap now
+                a, e, v, cv, cm = agent.sleep(
+                    horizon=15,
+                    dream_batch=sleep_batch_size,
+                    seed_protos=seed_protos,
+                    seed_windows=short_batch,
+                )
+                a_sum += a; e_sum += e; v_sum += v
+                cp_var.append(cv); cp_mean.append(cm)
+            error_tracker.append_sleep(a_sum / sleep_updates,
+                                    e_sum / sleep_updates,
+                                    v_sum / sleep_updates,
+                                    float(np.mean(cp_var)),
+                                    float(np.mean(cp_mean)))
+
+
 
         avg = np.mean(error_tracker.rewards[-log_every:])
-        print(f"Episode {episode + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
+        print(f"Episode {batches + 1:4d} | Avg Real Reward (last {log_every}): {avg:.1f}")
  
     return agent, error_tracker
  
@@ -1014,10 +1068,10 @@ def watch(agent, num_episodes=1, render=True):
 if __name__ == "__main__":
     # The loop is simple:
     # we train it for a number of episodes
-    trained_brain, error_tracker = train(num_episodes=1000, render=False)
+    trained_brain, error_tracker = train(num_episodes=50, render=False)
     trained_brain.freeze_all()
     # we then just force the brain to move in the world
     captured_frames = watch(trained_brain, num_episodes=1, render=True)
     ## Because we are cool we generate a pdf file with 
     # a report detailing the statistics during training
-    error_tracker.render_pdf(captured_frames)    
+    error_tracker.render_pdf(captured_frames)   
